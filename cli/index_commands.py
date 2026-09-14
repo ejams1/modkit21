@@ -100,8 +100,9 @@ def build(ctx, game, embeddings, domain):
     help="Limit to specific plugin file names (repeat for multiple). Defaults to all *.esm.",
 )
 @click.option("--fresh", is_flag=True, help="Clear each plugin's cache subdirectory before re-export.")
+@click.option("--workers", type=click.IntRange(min=1), default=1, show_default=True, help="Plugins to export in parallel; each worker loads a plugin.")
 @click.pass_context
-def regen_yaml(ctx, game, data_dir, plugins, fresh):
+def regen_yaml(ctx, game, data_dir, plugins, fresh, workers):
     """Re-export the game's master plugins into ``data/<game>_esm_yaml/``.
 
     Drives the records search index. Run before ``modkit index build --domain records``
@@ -109,6 +110,7 @@ def regen_yaml(ctx, game, data_dir, plugins, fresh):
     """
     from pathlib import Path
     from creation_lib.db.index_builder import regenerate_esm_yaml_cache
+    from cli._output import output
 
     if game is not None:
         ctx.obj["game"] = game
@@ -126,17 +128,21 @@ def regen_yaml(ctx, game, data_dir, plugins, fresh):
         resolved = Path(game_dir_str) / "Data"
 
     try:
-        regenerate_esm_yaml_cache(
+        results = regenerate_esm_yaml_cache(
             game,
             game_data_dir=resolved,
             project_root=get_app_root(),
-            db_dir=get_db_dir(),
+            db_dir=ctx.obj["db_dir"],
             plugins=list(plugins) if plugins else None,
             fresh=fresh,
-            on_progress=click.echo,
+            workers=workers,
+            on_progress=lambda message: click.echo(message, err=True),
         )
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         raise click.ClickException(str(e))
+    output({"game": game, "workers": workers, "plugins": results}, ctx.obj["fmt"])
+    if any(status.startswith("error:") for status in results.values()):
+        ctx.exit(1)
 
 
 @index.command("add-library")

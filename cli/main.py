@@ -6,12 +6,47 @@ import sys
 
 import click
 
+class ModkitGroup(click.Group):
+    def main(self, args=None, prog_name=None, complete_var=None, standalone_mode=True, **extra):
+        arguments = list(sys.argv[1:] if args is None else args)
+        fmt = "json"
+        for index, argument in enumerate(arguments):
+            if argument == "--format" and index + 1 < len(arguments):
+                fmt = arguments[index + 1]
+            elif argument.startswith("--format="):
+                fmt = argument.split("=", 1)[1]
+        try:
+            extra["windows_expand_args"] = False
+            result = super().main(arguments, prog_name, complete_var, standalone_mode=False, **extra)
+            if standalone_mode and isinstance(result, int):
+                raise SystemExit(result)
+            return result
+        except click.ClickException as error:
+            if not standalone_mode:
+                raise
+            emit_error(error.format_message(), fmt,
+                       code="INVALID_ARGUMENT" if isinstance(error, click.UsageError) else "COMMAND_FAILED",
+                       exit_code=error.exit_code)
+            raise SystemExit(error.exit_code) from error
+        except OSError as error:
+            if not standalone_mode:
+                raise
+            emit_error(error, fmt, code="IO_ERROR")
+            raise SystemExit(1) from error
+        except (ValueError, RuntimeError, ImportError) as error:
+            if not standalone_mode:
+                raise
+            emit_error(error, fmt, code="BACKEND_UNAVAILABLE" if isinstance(error, ImportError) else "COMMAND_FAILED")
+            raise SystemExit(1) from error
+
 # Ensure project root is on sys.path for lib imports
 _PROJECT_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 )
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+from cli._output import emit_error
 
 # Suppress noisy logging from libraries
 import logging
@@ -35,7 +70,7 @@ def _bootstrap_environment():
     load_dotenv_into_environ()
 
 
-@click.group()
+@click.group(cls=ModkitGroup)
 @click.option(
     "--game",
     default="",
@@ -44,7 +79,7 @@ def _bootstrap_environment():
 @click.option(
     "--format",
     "fmt",
-    type=click.Choice(["json", "pretty", "compact", "table"]),
+    type=click.Choice(["json", "pretty", "compact", "table", "jsonl"]),
     default="json",
     help="Output format.",
 )
@@ -53,12 +88,26 @@ def _bootstrap_environment():
     default="",
     help="Path to database directory. Defaults to ./data/ relative to exe.",
 )
+@click.option("--fields", default=None, help="Report projection: comma-separated dotted field paths.")
+@click.option("--where", multiple=True, help="Report predicate FIELD=VALUE; !=, >=, <=, >, <, ~ glob also supported. Repeat for AND.")
+@click.option("--items", default=None, help="Array inside a result to query, e.g. records or bindings.")
+@click.option("--limit", type=click.IntRange(min=0), default=None, help="Maximum report rows after filtering.")
+@click.option("--offset", type=click.IntRange(min=0), default=0, help="Report rows to skip after filtering.")
+@click.option("--count-only", is_flag=True, help="Return report counts without row payloads.")
+@click.option("--group-by", default=None, help="Count matching report rows by a dotted field path.")
+@click.option("--output", type=click.Path(dir_okay=False), default=None, help="Write report to this file and print its artifact summary. Put before the command.")
 @click.pass_context
-def cli(ctx, game: str, fmt: str, db_dir: str):
+def cli(ctx, game: str, fmt: str, db_dir: str, fields, where, items, limit, offset, count_only, group_by, output):
     """modkit — Bethesda modding toolkit CLI.
 
     Search game data, manipulate NIF meshes, and more.
     """
+    # Also configured in main(), but the `modkit` console script entry point is
+    # `cli` and so never reaches it. Piping any record carrying CJK strings — most
+    # of SeventySix.esm — then dies on a cp1252 stdout, which is how every
+    # generator that shells out to modkit.exe silently broke.
+    _configure_stdio()
+
     ctx.ensure_object(dict)
 
     # Resolve game
@@ -67,6 +116,11 @@ def cli(ctx, game: str, fmt: str, db_dir: str):
         game = os.environ.get("DEFAULT_GAME", "fo4")
     ctx.obj["game"] = game
     ctx.obj["fmt"] = fmt
+    from cli._query import parse_predicate
+    for predicate in where:
+        parse_predicate(predicate)
+    ctx.obj["report_options"] = dict(fields=fields, where=where, items=items, limit=limit,
+                                     offset=offset, count_only=count_only, group_by=group_by, output=output)
 
     # Resolve db_dir
     if not db_dir:
@@ -81,7 +135,9 @@ def cli(ctx, game: str, fmt: str, db_dir: str):
 
 
 @cli.command()
-def version():
+@click.option("--workspace", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Source checkout to compare with this executable's build receipt.")
+def version(workspace):
     """Print version and exit."""
     version_file = os.path.join(_PROJECT_ROOT, "VERSION")
     if not os.path.isfile(version_file) and getattr(sys, "frozen", False):
@@ -91,6 +147,17 @@ def version():
             click.echo(f"modkit {f.read().strip()}")
     else:
         click.echo("modkit (dev)")
+    if getattr(sys, "frozen", False):
+        import json
+        from pathlib import Path
+        from app.paths import get_app_root
+        from cli._build_info import source_fingerprint
+        root = Path(workspace) if workspace else get_app_root()
+        receipt = Path(sys._MEIPASS) / "modkit_build_info.json"
+        if receipt.is_file() and (root / "cli/main.py").is_file():
+            built = json.loads(receipt.read_text(encoding="utf-8"))
+            if source_fingerprint(root)["sha256"] != built["source"]["sha256"]:
+                click.echo("Warning: this modkit.exe differs from the workspace source. Rebuild it; use modkit doctor for details.", err=True)
 
 
 # Register command groups
@@ -104,6 +171,14 @@ cli.add_command(nif)
 from cli.cloth_commands import cloth  # noqa: E402
 
 cli.add_command(cloth)
+
+from cli.havok_commands import havok
+
+cli.add_command(havok)
+
+from cli.anim_commands import anim
+
+cli.add_command(anim)
 
 from cli.build_commands import build  # noqa: E402
 from cli.archive_commands import archive  # noqa: E402
@@ -128,6 +203,12 @@ cli.add_command(index)
 cli.add_command(swf)
 cli.add_command(setup)
 cli.add_command(world)
+
+from cli import inspection_commands as _inspection_commands  # noqa: E402, F401
+from cli.discovery_commands import register as _register_discovery  # noqa: E402
+
+_register_discovery(cli)
+_inspection_commands.register_asset_commands(cli)
 
 
 def _normalize_exit_code(code):

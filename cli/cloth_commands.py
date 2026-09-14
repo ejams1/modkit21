@@ -1,14 +1,4 @@
-"""modkit cloth — FO4 Havok cloth authoring commands.
-
-Command surface:
-    modkit cloth inspect <nif>      # summary of cloth data
-    modkit cloth dump <nif>         # full runtime graph (JSON)
-    modkit cloth extract <nif> -o   # write raw HCL packfile
-    modkit cloth pack <hkx> --into  # embed HCL into NIF
-
-M0 only implements the read-side commands. Write-side features
-(bake, tweak, template, etc.) come in later milestones.
-"""
+"""modkit cloth: FO4 Havok cloth authoring commands."""
 from __future__ import annotations
 
 import json
@@ -509,7 +499,7 @@ def import_cloth(ctx: click.Context, nif_path: Path, out: Path):
     """Import cloth data from a NIF as an editable setup JSON.
 
     Reads runtime cloth data, reverses it to the setup model,
-    and exports as JSON for editing or re-baking (M5).
+    and exports as JSON for editing or re-baking.
     """
     from creation_lib._native import havok_native as _hn
     from creation_lib._native import nif_core_native as _nif
@@ -767,7 +757,7 @@ def template_apply(ctx: click.Context, name: str, source_nif: Path, out: Path,
 
 
 # -------------------------------------------------------------------------
-# Region commands (M7)
+# Region commands
 # -------------------------------------------------------------------------
 
 @cloth.group()

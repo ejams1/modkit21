@@ -14,6 +14,20 @@ def texture(ctx):
     pass
 
 
+@texture.command("inspect")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.pass_context
+def inspect(ctx, path):
+    """Read DDS dimensions, format, mip levels and array/cubemap metadata."""
+    from creation_lib.dds.native_runtime import texdiag_info
+
+    info = texdiag_info(str(path.resolve()))
+    if info is None:
+        raise ImportError("Native DDS metadata inspection is unavailable; rebuild the creation native extension.")
+    output({"path": str(path.resolve()), "bytes": path.stat().st_size, **info,
+            "srgb": "SRGB" in str(info.get("format", "")).upper()}, ctx.obj["fmt"])
+
+
 @texture.group(name="recolor")
 @click.pass_context
 def recolor(ctx):

@@ -6,6 +6,7 @@ Command surface:
     modkit swf pack <swfproj> -o <swf>  # assemble SWF from project
     modkit swf index                    # build shape library from extracted SWFs
     modkit swf symbols list <swf>       # byte-exact SymbolClass export list (native)
+    modkit swf symbols validate <swf>   # SymbolClass names with no backing DoABC class
     modkit swf symbols inject ...       # splice named symbols src -> dst (native)
     modkit swf abc dump <swf>           # ABC constant-pool string table (class names)
     modkit swf abc markers <swf>        # which canonical marker classes the SWF has
@@ -18,7 +19,6 @@ used for inspecting/editing real menu SWFs.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import click
@@ -33,8 +33,10 @@ def swf():
 
 @swf.command()
 @click.argument("swf_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--sprites", "show_sprites", is_flag=True,
+              help="Also list every sprite's character id and timeline frame count")
 @click.pass_context
-def inspect(ctx: click.Context, swf_path: Path):
+def inspect(ctx: click.Context, swf_path: Path, show_sprites: bool):
     """Print summary of SWF structure.
 
     Shows: version, canvas size, FPS, frame count, shape count,
@@ -69,10 +71,16 @@ def inspect(ctx: click.Context, swf_path: Path):
         "background": doc.background_color.to_hex(),
         "shape_count": len(doc.shapes),
         "sprite_count": len(doc.sprites),
+        "export_count": len(doc.symbols),
         "total_tags": len(doc.tags),
         "raw_tags": len(doc.raw_tags),
         "tag_breakdown": tag_counts,
     }
+    if show_sprites:
+        summary["sprites"] = [
+            {"character_id": sid, "frames": sprite.timeline.frame_count}
+            for sid, sprite in sorted(doc.sprites.items())
+        ]
 
     if fmt in JSON_FORMATS:
         output(summary, fmt)
@@ -85,17 +93,26 @@ def inspect(ctx: click.Context, swf_path: Path):
         click.echo(f"  BG:      {doc.background_color.to_hex()}")
         click.echo(f"  Shapes:  {len(doc.shapes)}")
         click.echo(f"  Sprites: {len(doc.sprites)}")
+        click.echo(f"  Exports: {len(doc.symbols)}")
         click.echo(f"  Tags:    {len(doc.tags)} ({len(doc.raw_tags)} unparsed)")
         for name, count in sorted(tag_counts.items()):
             click.echo(f"    {name}: {count}")
+        if show_sprites:
+            click.echo("  Sprite timelines:")
+            for sid, sprite in sorted(doc.sprites.items()):
+                click.echo(f"    sprite {sid}: {sprite.timeline.frame_count} frames")
 
 
 @swf.command()
 @click.argument("swf_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
               help="Output directory for SVGs (default: <swf_name>_shapes/)")
+@click.option("--background/--no-background", default=True,
+              help="Draw a preview background rect behind each shape. Pass "
+                   "--no-background when the SVGs will be re-packed, or the rect "
+                   "imports as an opaque quad over the art.")
 @click.pass_context
-def extract(ctx: click.Context, swf_path: Path, output: Path | None):
+def extract(ctx: click.Context, swf_path: Path, output: Path | None, background: bool):
     """Export all shapes from a SWF as individual SVG files."""
     from creation_lib.swf.parser import parse_swf_file
     from creation_lib.swf.svg_io import shape_to_svg
@@ -112,7 +129,7 @@ def extract(ctx: click.Context, swf_path: Path, output: Path | None):
 
     count = 0
     for shape_id, shape in doc.shapes.items():
-        svg = shape_to_svg(shape)
+        svg = shape_to_svg(shape, background="#333333" if background else None)
         svg_path = out_dir / f"shape_{shape_id}.svg"
         svg_path.write_text(svg, encoding="utf-8")
         count += 1
@@ -126,48 +143,43 @@ def extract(ctx: click.Context, swf_path: Path, output: Path | None):
               help="Output SWF path")
 @click.pass_context
 def pack(ctx: click.Context, project_path: Path, output: Path):
-    """Assemble a SWF from a .swfproj project file."""
-    from creation_lib.swf.writer import write_swf_file
-    from creation_lib.swf.parser import SwfDocument, SwfHeader
-    from creation_lib.swf.types import RECT, RGBA
-    from creation_lib.swf.tags import (
-        FileAttributesTag, SetBackgroundColorTag, ShowFrameTag, EndTag,
-    )
-    from creation_lib.swf.timeline import Timeline
+    """Assemble a SWF from a .swfproj project file.
+
+    The project declares shapes (imported from SVG), sprites whose timelines
+    place that art frame by frame, the main-timeline stage, and the SymbolClass
+    exports that name characters for the outside world. Each export also gets an
+    AS3 class synthesized into a DoABC tag, and the result is refused if any
+    export name is left unbacked. See `creation_lib.swf.project` for the schema.
+    """
+    from creation_lib.swf import native_runtime
+    from creation_lib.swf.project import load_project_file
+    from creation_lib.swf.writer import write_swf
 
     try:
-        proj = json.loads(project_path.read_text(encoding="utf-8"))
+        doc = load_project_file(project_path)
+        data = write_swf(doc)
+        unbacked = native_runtime.unbacked_symbol_classes(data)
     except Exception as exc:
-        click.echo(f"error: failed to read project: {exc}", err=True)
+        click.echo(f"error: failed to build project: {exc}", err=True)
         ctx.exit(2)
         return
 
-    canvas = proj.get("canvas", [550, 400])
-    fps = proj.get("fps", 30)
-    bg = proj.get("background", "#333333")
+    if unbacked:
+        click.echo(
+            f"error: {len(unbacked)} SymbolClass export(s) have no AS3 class behind "
+            f"them, so the engine could not construct them: {', '.join(unbacked)}",
+            err=True,
+        )
+        ctx.exit(2)
+        return
 
-    doc = SwfDocument(
-        header=SwfHeader(
-            compression="CWS",
-            version=17,
-            file_length=0,
-            frame_size=RECT(xmin=0, xmax=canvas[0] * 20, ymin=0, ymax=canvas[1] * 20),
-            fps=fps,
-            frame_count=1,
-        ),
-        background_color=RGBA.from_hex(bg),
-        main_timeline=Timeline(),
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data)
+    click.echo(
+        f"Packed SWF: {output} "
+        f"({len(doc.shapes)} shapes, {len(doc.sprites)} sprites, "
+        f"{len(doc.symbols)} exports, {doc.header.frame_count} frames)"
     )
-    doc.tags = [
-        FileAttributesTag(),
-        SetBackgroundColorTag(color=doc.background_color),
-        ShowFrameTag(),
-        EndTag(),
-    ]
-    doc.header.frame_count = 1
-
-    write_swf_file(doc, output)
-    click.echo(f"Packed SWF: {output}")
 
 
 @swf.command("index")
@@ -227,6 +239,42 @@ def symbols_list(ctx: click.Context, swf_path: Path):
         for cid, name in syms:
             click.echo(f"  {cid:>5}  {name}")
         click.echo(f"{len(syms)} symbols")
+
+
+@symbols.command("validate")
+@click.argument("swf_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--no-fail", is_flag=True, help="Report unbacked names but exit 0")
+@click.pass_context
+def symbols_validate(ctx: click.Context, swf_path: Path, no_fail: bool):
+    """Report SymbolClass export names that no DoABC in the file defines.
+
+    A dangling binding names a class the engine cannot construct, so the symbol
+    comes back null wherever it is loaded. Exits 1 when any name is unbacked.
+    """
+    from creation_lib.swf import native_runtime
+
+    try:
+        data = swf_path.read_bytes()
+        defined = native_runtime.abc_class_names(data)
+        symbol_names = [name for _, name in native_runtime.list_symbols(data)]
+        unbacked = native_runtime.unbacked_symbol_classes(data)
+    except Exception as exc:
+        click.echo(f"error: {exc}", err=True)
+        ctx.exit(2)
+        return
+
+    fmt = ctx.obj.get("fmt", "json") if ctx.obj else "json"
+    if fmt in JSON_FORMATS:
+        output({"symbols": len(symbol_names), "defined_classes": len(defined),
+                "unbacked": unbacked}, fmt)
+    else:
+        click.echo(f"{len(symbol_names)} SymbolClass export(s), "
+                   f"{len(defined)} AS3 class(es) defined")
+        for name in unbacked:
+            click.echo(f"  UNBACKED  {name}")
+        click.echo(f"{len(unbacked)} unbacked")
+    if unbacked and not no_fail:
+        ctx.exit(1)
 
 
 @symbols.command("inject")

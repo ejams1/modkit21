@@ -1,9 +1,8 @@
 """modkit data audit-yaml — static field-whitelist audit for mod YAMLs.
 
-Third line of defense against source-game field leakage (see
-handoffs/2026-04-07-snallygaster-fo76-field-leakage.md). Walks a mod's
-yaml/ tree, infers record type from the record directory name, and checks
-every authoring field against bacup/py_bacup_lib/python/bacup_lib/record/whitelists/<game>.yaml.
+Catches source-game field leakage. Walks a mod's yaml/ tree, infers record type
+from the record directory name, and checks every authoring field against
+bacup/py_bacup_lib/python/bacup_lib/record/whitelists/<game>.yaml.
 
 Registered as a subcommand of `modkit data` by importing this module
 after `cli.data_commands` (see cli/main.py).
@@ -32,7 +31,7 @@ def _load_whitelist(game: str) -> dict[str, set[str]]:
     """Load bacup_lib's field whitelist and return {record_type: {field, ...}}.
 
     Applies the overrides block (add/drop) on top of record_types. Comparison
-    is case-sensitive per handoff gotchas.
+    is case-sensitive.
     """
     if not _WHITELIST_DIR.is_dir():
         raise click.ClickException(
@@ -120,6 +119,39 @@ def _record_field_names(record: Any) -> list[str]:
     return []
 
 
+def _scalar_warnings(text: str) -> list[dict[str, Any]]:
+    warnings = []
+    visited = set()
+
+    def visit(node):
+        if id(node) in visited:
+            return
+        visited.add(id(node))
+        if isinstance(node, yaml.ScalarNode) and node.style is None:
+            value = node.value
+            reason = None
+            if node.tag.endswith(":bool") and value.casefold() not in {"true", "false"}:
+                reason = "YAML 1.1 interprets this as a boolean; quote it if you intend a string."
+            elif node.tag.endswith(":int") and (value.lower().startswith(("0x", "-0x", "+0x"))
+                                               or len(value) > 1 and value.startswith("0")):
+                reason = "YAML interprets this as a number; quote identifiers to preserve their spelling and radix."
+            if reason:
+                warnings.append({"line": node.start_mark.line + 1, "column": node.start_mark.column + 1,
+                                 "value": value, "parsed_as": node.tag.rsplit(":", 1)[-1], "message": reason})
+        elif isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                visit(key)
+                visit(value)
+        elif isinstance(node, yaml.SequenceNode):
+            for child in node.value:
+                visit(child)
+
+    node = yaml.compose(text)
+    if node is not None:
+        visit(node)
+    return warnings
+
+
 @data.command("audit-yaml")
 @click.argument("mod_name")
 @click.option(
@@ -170,15 +202,19 @@ def audit_yaml(ctx, mod_name: str, mods_dir: str):
     files_with_unknowns = 0
     unknown_total = 0
     unknown_record_types: set[str] = set()
+    scalar_warnings = []
+    parse_errors = []
 
     for record_type, path in _iter_record_yamls(yaml_dir):
         files_checked += 1
         per_record_type[record_type]["files_checked"] += 1
 
         try:
-            with open(path, encoding="utf-8") as f:
-                record = yaml.safe_load(f)
+            text = path.read_text(encoding="utf-8")
+            record = yaml.safe_load(text)
+            scalar_warnings.extend({"file": _display_path(path), **warning} for warning in _scalar_warnings(text))
         except yaml.YAMLError as e:
+            parse_errors.append({"file": _display_path(path), "error": str(e)})
             per_record_type[record_type]["files_with_unknowns"].append(
                 {"file": _display_path(path), "parse_error": str(e)}
             )
@@ -241,9 +277,12 @@ def audit_yaml(ctx, mod_name: str, mods_dir: str):
         "unknown_record_types": sorted(unknown_record_types),
         "top_unknown_fields_global": unknown_counter_global.most_common(20),
         "by_record_type": by_record_type_report,
-        "status": "clean" if unknown_total == 0 and not unknown_record_types else "unknowns_found",
+        "scalar_warnings": scalar_warnings,
+        "parse_errors": parse_errors,
+        "status": "parse_errors" if parse_errors else "unknowns_found" if unknown_total or unknown_record_types
+                  else "scalar_warnings" if scalar_warnings else "clean",
     }
 
     output(report, fmt)
-    if unknown_total > 0 or unknown_record_types:
+    if unknown_total > 0 or unknown_record_types or parse_errors:
         sys.exit(1)

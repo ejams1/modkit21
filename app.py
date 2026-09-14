@@ -1,11 +1,8 @@
 """ModBox21 — Bethesda Modding Toolkit."""
 
-# OpenCV's EXR codec is gated by this environment variable and must be set
-# BEFORE cv2 is imported anywhere in the process. We need EXR support so the
-# Starfield renderer can load the GGX-prefiltered HDR probe
-# (resource/monochrome_studio_02_1k.exr) via
-# shader_pipeline.build_environment_cubes. Setting it here, at the top of the
-# main entry, guarantees it lands before any transitive cv2 import.
+# OpenCV reads OPENCV_IO_ENABLE_OPENEXR when cv2 is first imported. The Starfield
+# renderer needs EXR for its HDR probe (resource/monochrome_studio_02_1k.exr), so it
+# is set here, before any transitive cv2 import.
 import os
 import sys
 from pathlib import Path

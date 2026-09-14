@@ -4,7 +4,12 @@ import json
 import os
 import sys
 
-JSON_FORMATS = {"json", "compact", "pretty"}
+import click
+from pathlib import Path
+
+from cli._query import query_options_active, query_result
+
+JSON_FORMATS = {"json", "compact", "pretty", "jsonl"}
 
 
 def format_json(data, fmt: str = "json") -> str:
@@ -19,18 +24,70 @@ def format_json_text(text: str, fmt: str = "json") -> str:
     return format_json(json.loads(text), "pretty" if fmt == "pretty" else "json")
 
 
-def output(data, fmt: str = "json"):
+def output(data, fmt: str = "json", *, collection=None, queried=False):
     """Format and print result data."""
     if isinstance(data, dict) and "error" in data:
-        print(f"Error: {data['error']}", file=sys.stderr)
+        emit_error(data["error"], fmt, code=data.get("code", "COMMAND_FAILED"))
         sys.exit(1)
 
+    ctx = click.get_current_context(silent=True)
+    options = (ctx.obj or {}).get("report_options", {}) if ctx else {}
+    if collection is None and isinstance(data, dict):
+        candidates = [key for key in ("records", "results", "matches", "children", "files", "bindings", "changes", "assets", "commands")
+                      if isinstance(data.get(key), list)]
+        if len(candidates) == 1:
+            collection = candidates[0]
+    if not queried and query_options_active(options):
+        data = query_result(data, options, collection)
+    destination = options.get("output")
+    if destination:
+        path = Path(destination).expanduser().resolve()
+        source_ctx = ctx
+        while source_ctx:
+            for param in source_ctx.command.params:
+                if isinstance(param.type, click.Path) and param.type.exists:
+                    value = source_ctx.params.get(param.name)
+                    values = value if isinstance(value, (tuple, list)) else [value]
+                    if any(value and Path(value).resolve() == path for value in values):
+                        raise click.BadParameter("Report output must differ from input paths", param_hint="--output")
+            source_ctx = source_ctx.parent
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            _write_result(data, fmt, stream, collection)
+        print(format_json({"artifact": {"path": str(path), "bytes": path.stat().st_size, "format": fmt},
+                           **({"meta": data["meta"]} if isinstance(data, dict) and "meta" in data else {})}))
+        return
+    _write_result(data, fmt, sys.stdout, collection)
+
+
+def emit_error(message, fmt="json", *, code="COMMAND_FAILED", exit_code=1):
     if fmt in JSON_FORMATS:
-        print(format_json(data, fmt))
-    elif fmt == "table":
-        _format_table(data)
+        print(format_json({"error": {"code": code, "message": str(message), "exit_code": exit_code}}), file=sys.stderr)
     else:
-        print(format_json(data))
+        print(f"Error: {message}", file=sys.stderr)
+
+
+def _write_result(data, fmt, stream, collection=None):
+    if fmt == "jsonl":
+        if isinstance(data, dict) and "data" in data and "meta" in data:
+            rows, meta = data["data"], data["meta"]
+        elif collection and isinstance(data, dict):
+            rows = data[collection]
+            meta = {key: value for key, value in data.items() if key != collection}
+        else:
+            rows, meta = data if isinstance(data, list) else [data], {}
+        for row in rows:
+            print(format_json({"kind": "row", "data": row}), file=stream)
+        print(format_json({"kind": "meta", "meta": meta}), file=stream)
+        return
+    if fmt in JSON_FORMATS:
+        print(format_json(data, fmt), file=stream)
+    elif fmt == "table":
+        from contextlib import redirect_stdout
+        with redirect_stdout(stream):
+            _format_table(data)
+    else:
+        print(format_json(data), file=stream)
 
 
 def _format_table(data):

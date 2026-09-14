@@ -1,17 +1,12 @@
 """Parent-death watchdog: force-exit modkit when its launcher goes away.
 
-On Windows, killing a process does NOT kill its children. When an AI agent
-aborts a long request or a command times out, the agent kills the shell it
-spawned to run modkit -- but modkit.exe survives as an orphan and keeps running
-its native worker threads (conversion, LOD gen, texture batches) to completion
-in the background, holding gigabytes of RAM until it finishes or is killed by
-hand. This watchdog watches the original parent process and tears modkit down
-the moment that parent exits.
+On Windows, killing a process does not kill its children. When an agent kills
+the shell that launched modkit, modkit.exe survives as an orphan and keeps its
+native workers (conversion, LOD gen, texture batches) running, holding gigabytes
+of RAM. This watchdog exits modkit as soon as the original parent exits.
 
-Watching the parent process -- rather than stdin EOF -- is deliberate: some
-commands read piped input from stdin (`esp set-record - `), so a stdin watchdog
-would race them for input. The parent handle is untouched by normal command I/O
-and only signals on the exact event we care about: the launcher dying.
+It watches the parent rather than stdin EOF because some commands read piped
+stdin (`esp set-record -`), and a stdin watchdog would race them for input.
 """
 from __future__ import annotations
 

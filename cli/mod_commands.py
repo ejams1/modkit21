@@ -157,20 +157,27 @@ def import_mod(ctx, source_dir, name, mod_prefix, no_git):
 @click.option("--skip-compile", "--skip-papyrus-compile", "skip_papyrus_compile", is_flag=True,
               help="Skip Papyrus (.psc → .pex) compilation (use existing .pex)")
 @click.option("--esp-only", is_flag=True, help="Deploy only the .esp")
+@click.option("--source", default=None, help="Plugin binary, whole-plugin YAML/JSON, or authoring directory inside the mod folder (relative to that folder).")
+@click.option("--preserve-xse-inis", is_flag=True, help="Keep existing XSE .ini files in the deploy target; copy missing INIs normally.")
 @click.option("--no-esp", is_flag=True, help="Mod has no .esp (XSE-plugin-only); deploys mods/<name>/<XSE>/ to game Data/<XSE>/ (XSE = F4SE|SKSE|SFSE|NVSE|FOSE per the mod's .game)")
 @click.option("--xbox", is_flag=True, help="Also create Xbox-format archives")
+@click.option("--ps", is_flag=True, help="Also create PlayStation-format archives")
 @click.option("--pc-max-res", type=int, default=0, help="Max texture resolution for PC (0 = unlimited)")
-@click.option("--xbox-max-res", type=int, default=1024, help="Max texture resolution for Xbox")
+@click.option("--xbox-max-res", type=int, default=0, help="Max texture resolution for Xbox (0 = unlimited)")
+@click.option("--ps-max-res", type=int, default=0, help="Max texture resolution for PlayStation (0 = unlimited)")
 @click.option("--data-dir", default=None, help="Override game Data/ directory")
 @click.option("--archive-max-size-gb", type=float, default=16.0,
-              help="Maximum archive size in GiB before splitting (default 16.0)")
+              help="Maximum expanded archive size in GiB before splitting (default 16.0)")
 @click.option("--expanded-archives", is_flag=True, default=False,
               help="Use family archive labels such as Meshes and Sounds instead of Main + Textures when possible.")
+@click.option("--ba2-target", type=click.Choice(["auto", "og", "nextgen"]), default="auto", show_default=True,
+              help="FO4 archive version: detect the deploy install, force v1 (og), or v8 (nextgen).")
 @click.option("--all", "deploy_all", is_flag=True, help="Deploy main + all patch plugins")
 @click.option("--patch", "patch_name", default=None, help="Deploy a specific patch plugin only")
 @click.option("--loose", is_flag=True, help="Deploy as loose files (no BA2 packing); writes .loose_manifest.json")
+@click.option("--dry-run", is_flag=True, help="Plan builds, copies, preserved INIs and removals without writing files.")
 @click.pass_context
-def deploy(ctx, name, skip_build, skip_pack, skip_papyrus_compile, esp_only, no_esp, xbox, pc_max_res, xbox_max_res, data_dir, archive_max_size_gb, expanded_archives, deploy_all, patch_name, loose):
+def deploy(ctx, name, skip_build, skip_pack, skip_papyrus_compile, esp_only, preserve_xse_inis, source, no_esp, xbox, ps, pc_max_res, xbox_max_res, ps_max_res, data_dir, archive_max_size_gb, expanded_archives, ba2_target, deploy_all, patch_name, loose, dry_run):
     """Deploy a mod: build .esp, pack BA2, copy to game Data.
 
     Use ``--loose`` to copy assets as loose files instead of packing BA2s. A
@@ -183,6 +190,8 @@ def deploy(ctx, name, skip_build, skip_pack, skip_papyrus_compile, esp_only, no_
     ``<XSE>`` directory is F4SE/SKSE/SFSE/NVSE/FOSE per the mod's .game file.
     """
     from pathlib import Path
+    from dataclasses import asdict
+    from cli._output import output
     from creation_lib.build.archive_plan import gib_to_bytes
     from creation_lib.build.deployer import deploy_mod
     from app.paths import get_app_root, get_resource_dir
@@ -194,22 +203,39 @@ def deploy(ctx, name, skip_build, skip_pack, skip_papyrus_compile, esp_only, no_
     except ValueError as exc:
         raise click.ClickException(str(exc))
 
+    if no_esp and source:
+        raise click.ClickException("--source cannot be combined with --no-esp")
+    if loose and (deploy_all or patch_name or no_esp):
+        raise click.ClickException("--loose does not support --all/--patch/--no-esp")
+    if dry_run:
+        from creation_lib.build.deploy_plan import plan_deploy
+        from cli._output import output
+        output(plan_deploy(get_app_root() / "mods" / name, game_data, game=game, source=source,
+            no_esp=no_esp, esp_only=esp_only and not loose, loose=loose, skip_build=skip_build, skip_pack=skip_pack,
+            skip_papyrus_compile=skip_papyrus_compile, preserve_xse_inis=preserve_xse_inis,
+            patches=["all"] if deploy_all else [patch_name] if patch_name else None, fo4_ba2_target=ba2_target),
+            ctx.obj["fmt"], collection="operations")
+        return
+
     if loose:
         from creation_lib.build.loose_deploy import deploy_loose_assets
         if deploy_all or patch_name or no_esp:
             raise click.ClickException("--loose does not support --all/--patch/--no-esp")
         try:
-            deploy_loose_assets(
+            result = deploy_loose_assets(
                 name,
                 game=game,
                 game_data_dir=game_data,
                 skip_build=skip_build,
                 skip_papyrus_compile=skip_papyrus_compile,
+                preserve_xse_inis=preserve_xse_inis,
+                source=source,
                 project_root=get_app_root(),
-                on_progress=click.echo,
+                on_progress=lambda message: click.echo(message, err=True),
             )
         except (FileNotFoundError, RuntimeError) as e:
             raise click.ClickException(str(e))
+        output(asdict(result), ctx.obj["fmt"])
         return
 
     patches = None
@@ -228,18 +254,24 @@ def deploy(ctx, name, skip_build, skip_pack, skip_papyrus_compile, esp_only, no_
             skip_papyrus_compile=skip_papyrus_compile,
             esp_only=esp_only,
             no_esp=no_esp,
+            preserve_xse_inis=preserve_xse_inis,
+            source=source,
             xbox=xbox,
+            ps=ps,
             pc_max_res=pc_max_res,
             xbox_max_res=xbox_max_res,
+            ps_max_res=ps_max_res,
             patches=patches,
             project_root=get_app_root(),
             resource_dir=get_resource_dir(),
             archive_max_bytes=archive_max_bytes,
             expanded_archives=expanded_archives,
-            on_progress=click.echo,
+            fo4_ba2_target=ba2_target,
+            on_progress=lambda message: click.echo(message, err=True),
         )
     except (FileNotFoundError, RuntimeError) as e:
         raise click.ClickException(str(e))
+    output(asdict(result), ctx.obj["fmt"])
 
 
 @mod.command("deploy-loose-file")
@@ -248,7 +280,7 @@ def deploy(ctx, name, skip_build, skip_pack, skip_papyrus_compile, esp_only, no_
 @click.option("--data-dir", default=None, help="Override game Data/ directory")
 @click.pass_context
 def deploy_loose_file_command(ctx, name, asset_path, data_dir):
-    """Deploy one mod asset as a tracked loose file."""
+    """Deploy one mod asset or asset directory as tracked loose files."""
     from pathlib import Path
     from creation_lib.build.loose_deploy import deploy_loose_file
     from app.paths import get_app_root
@@ -271,12 +303,14 @@ def deploy_loose_file_command(ctx, name, asset_path, data_dir):
 @mod.command()
 @click.argument("name")
 @click.option("--data-dir", default=None, help="Override game Data/ directory")
+@click.option("--verify-stock", is_flag=True, help="Require stock Papyrus compiler acceptance before replacing any PEX output.")
 @click.pass_context
-def compile(ctx, name, data_dir):
+def compile(ctx, name, data_dir, verify_stock):
     """Compile Papyrus scripts (.psc → .pex) for a mod into data/Scripts/."""
     from pathlib import Path
     from app.paths import get_app_root
     from creation_lib.build.deployer import compile_papyrus
+    from cli._output import output
 
     game = _resolve_mod_game(ctx, name)
     game_data = Path(data_dir) if data_dir else _resolve_game_data_dir(game)
@@ -286,14 +320,12 @@ def compile(ctx, name, data_dir):
         raise click.ClickException(f"Mod not found: {mod_dir}")
 
     try:
-        compiled = compile_papyrus(mod_dir, game, game_data, on_progress=click.echo)
+        compiled = compile_papyrus(mod_dir, game, game_data, verify_stock=verify_stock,
+                                   on_progress=lambda message: click.echo(message, err=True))
     except (FileNotFoundError, RuntimeError) as e:
         raise click.ClickException(str(e))
 
-    if compiled == 0:
-        click.echo("No .psc files found — nothing compiled")
-    else:
-        click.echo(f"Done — compiled {compiled} script(s)")
+    output({"mod": name, "compiled": compiled, "stock_verified": compiled if verify_stock else 0}, ctx.obj["fmt"])
 
 
 @mod.command()
@@ -369,15 +401,21 @@ def import_loose(ctx, name, data_dir):
 @click.option("--patch", "patch_name", default=None, help="Undeploy a specific patch plugin only")
 @click.option("--loose", is_flag=True, help="Undeploy a loose deployment (uses .loose_manifest.json)")
 @click.option("--no-esp", is_flag=True, help="Undeploy an XSE-plugin-only mod (mirrors `deploy --no-esp`)")
+@click.option("--dry-run", is_flag=True, help="List files that would be removed without deleting anything.")
+@click.option("--source", default=None, help="Identify a plugin whose filename differs from the mod folder; same selection as deploy --source.")
 @click.pass_context
-def undeploy(ctx, name, data_dir, undeploy_all, patch_name, loose, no_esp):
+def undeploy(ctx, name, data_dir, undeploy_all, patch_name, loose, no_esp, dry_run, source):
     """Remove a deployed mod from the game Data folder."""
     from pathlib import Path
     from creation_lib.build.deployer import undeploy_mod
+    from cli._output import output
     from app.paths import get_app_root
 
     game = _resolve_mod_game(ctx, name)
     game_data = Path(data_dir) if data_dir else _resolve_game_data_dir(game)
+
+    if source and (loose or no_esp):
+        raise click.UsageError("--source is only used when undeploying a plugin without --loose/--no-esp")
 
     if loose:
         from creation_lib.build.loose_deploy import undeploy_loose_assets
@@ -387,10 +425,12 @@ def undeploy(ctx, name, data_dir, undeploy_all, patch_name, loose, no_esp):
             name,
             game_data_dir=game_data,
             project_root=get_app_root(),
-            on_progress=click.echo,
+            dry_run=dry_run,
+            on_progress=None if dry_run else lambda message: click.echo(message, err=True),
         )
-        if not removed:
+        if not removed and not dry_run:
             raise click.ClickException(f"No loose deployment found for {name}")
+        output({"mod": name, "dry_run": dry_run, "files": removed}, ctx.obj["fmt"], collection="files")
         return
 
     patches = None
@@ -406,7 +446,10 @@ def undeploy(ctx, name, data_dir, undeploy_all, patch_name, loose, no_esp):
         no_esp=no_esp,
         patches=patches,
         project_root=get_app_root(),
-        on_progress=click.echo,
+        dry_run=dry_run,
+        source=source,
+        on_progress=None if dry_run else lambda message: click.echo(message, err=True),
     )
-    if not removed:
+    if not removed and not dry_run:
         raise click.ClickException(f"No deployed files found for {name}")
+    output({"mod": name, "dry_run": dry_run, "files": removed}, ctx.obj["fmt"], collection="files")

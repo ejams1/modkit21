@@ -1,12 +1,9 @@
 """CLI tests for `modkit esp strip-distant-lod`.
 
-Reverts a synthesize_object_lod pass: drops every MNAM ("Distant LOD")
-subrecord and clears the 0x8000 ("Has Distant LOD") record-header flag.
-
-The flag read/write goes through two native functions
-(`plugin_handle_record_flags` / `plugin_handle_set_record_flags`) that ship in a
-freshly built `_native.pyd`. The full round-trip test is skipped until the
-extension is rebuilt; the pure-transform unit test always runs.
+The command drops every MNAM ("Distant LOD") subrecord and clears the 0x8000
+("Has Distant LOD") record-header flag. The round-trip test needs the native
+`plugin_handle_record_flags` / `plugin_handle_set_record_flags` functions and
+skips without them; the pure-transform unit test always runs.
 """
 from __future__ import annotations
 

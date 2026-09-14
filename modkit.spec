@@ -10,6 +10,9 @@ import glob as _glob
 import os
 import sys
 from PyInstaller.utils.hooks import collect_dynamic_libs
+from cli._build_info import write_build_info
+
+_build_info = write_build_info(os.getcwd(), "build/modkit_build_info.json")
 
 block_cipher = None
 
@@ -62,9 +65,11 @@ a = Analysis(
         ("py_creation_lib/python/creation_lib", "py_creation_lib/python/creation_lib"),
         # VERSION file
         ("VERSION", "."),
+        (_build_info, "."),
     ],
     hiddenimports=[
         "numpy",
+        "PIL.Image",
         "sqlite3",
         "sqlite_vec",
         "click",
@@ -76,7 +81,7 @@ a = Analysis(
         "cli.setup_gui",
         "app.env_sync",
         "ui.toolkit.settings",
-        "ui.toolkit.path_detector",
+        "creation_lib.core.path_detector",
         "cli.archive_commands",
         "xml.etree.ElementTree",
         "creation_lib.nif",
@@ -172,8 +177,6 @@ a = Analysis(
         "watchdog",
         "pywinpty",
         "pyte",
-        "PIL",
-        "pillow",
         "cv2",
         "imagequant",
         "pedalboard",

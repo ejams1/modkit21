@@ -51,6 +51,7 @@ def _load_plugin(
     strings_dir: str | None,
     language: str | None,
     backend: str,
+    lazy_index: bool = False,
 ):
     from creation_lib.esp import Plugin
 
@@ -60,6 +61,7 @@ def _load_plugin(
         strings_dir=strings_dir,
         language=language,
         backend=backend,
+        lazy_index=lazy_index,
     )
 
 
@@ -97,19 +99,43 @@ def _resolve_master_size(name: str, search_paths: list[Path]) -> int:
 
 
 def _resolve_record_id(plugin, record_id: str) -> int | None:
-    """Resolve an EditorID (case-insensitive) or local hex FormID to a numeric form_id.
+    """Resolve a local hex FormID or an EditorID (case-insensitive) to a form_id.
 
-    Returns None when the value is neither a known EditorID nor parseable hex, or
+    Hex is tried first so a FormID lookup never builds the EditorID index, which
+    costs hundreds of MB on a master-sized plugin. An existing FormID wins over an
+    EditorID spelled as the same hex digits.
+
+    Returns None when the value is neither parseable hex nor a known EditorID, or
     when an EditorID matches more than one record (ambiguous).
     """
+    try:
+        form_id = int(record_id, 16)
+    except ValueError:
+        pass
+    else:
+        # record_context resolves through the lazy store's early-exit walk.
+        # get_record_by_form_id would go via ensure_core_section, indexing the
+        # whole plugin for a lookup that needs one record.
+        handle = getattr(plugin, "_rust_handle", None)
+        if handle is not None:
+            from creation_lib.esp import native_runtime as _nr
+
+            if _nr.plugin_handle_call(handle, "record_context_for_form_id", form_id):
+                return form_id
+        elif plugin.get_record_by_form_id(form_id) is not None:
+            return form_id
+
     idx = plugin.eid_index()
     hit = idx.get(record_id)
     if hit is None:
-        hit = next((v for k, v in idx.items() if k.lower() == record_id.lower()), None)
+        lowered = record_id.lower()
+        hit = next((v for k, v in idx.items() if k.lower() == lowered), None)
     if hit is not None:
         if len(hit) != 1:
             return None
         return int(hit[0].split(":")[-1], 16)
+    # A well-formed but absent FormID still returns a number, so the caller
+    # reports "record not found" rather than "not a FormID or EditorID".
     try:
         return int(record_id, 16)
     except ValueError:
@@ -144,6 +170,19 @@ def _xloc_level(subrecords: list[tuple[str, bytes, str | None]] | None) -> int |
         if signature == "XLOC":
             return data[0] if data else None
     return None
+
+
+def _record_model_paths(
+    subrecords: list[tuple[str, bytes, str | None]] | None,
+) -> list[str]:
+    paths: list[str] = []
+    for signature, data, _semantic_type in subrecords or ():
+        if signature != "MODL":
+            continue
+        path = bytes(data).split(b"\0", 1)[0].decode("cp1252", errors="replace")
+        if path and path not in paths:
+            paths.append(path)
+    return paths
 
 
 # Well-known FO4 master RACE records so `--race HumanRace` resolves without the
@@ -395,13 +434,13 @@ def inspect(ctx, plugin_path, strings_dir, language, backend):
             if handle is not None
             else []
         )
-        signatures = {str(signature): int(count) for signature, count in groups}
+        signatures = _native_runtime.plugin_handle_record_counts(handle) if handle is not None else {}
         result = {
             "plugin": plugin.plugin_name,
             "game": plugin.game,
             "header_size": plugin.header_size,
             "record_count": plugin.record_count,
-            "group_count": len(signatures),
+            "group_count": len(groups),
             "masters": plugin.header.masters,
             "localized": plugin.header.is_localized,
             "localized_string_count": len(plugin.localized_strings),
@@ -482,8 +521,9 @@ def audit_topology(ctx, source_path, output_path, source_game, target_game, repo
 @click.option("--strings-dir", default=None, help="Override localized strings directory.")
 @click.option("--language", default=None, help="Preferred localized strings language.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
+@click.option("--full-load", is_flag=True, default=False, help="Load the whole plugin instead of resolving records lazily. Diagnostic escape hatch; slower and far more memory.")
 @click.pass_context
-def list_records(ctx, plugin_path, record_types, match_pattern, mode_substring, mode_regex, match_full, case_sensitive, subrecord_signatures, include_subrecord_data, max_results, strings_dir, language, backend):
+def list_records(ctx, plugin_path, record_types, match_pattern, mode_substring, mode_regex, match_full, case_sensitive, subrecord_signatures, include_subrecord_data, max_results, strings_dir, language, backend, full_load):
     """List a plugin's records as EditorID + local FormID pairs.
 
     FormIDs are plugin-local object IDs (e.g. 000800, not 01000800). Pass --match
@@ -508,19 +548,30 @@ def list_records(ctx, plugin_path, record_types, match_pattern, mode_substring, 
         strings_dir=strings_dir,
         language=language,
         backend=backend,
+        lazy_index=not full_load,
     ) as plugin:
         handle = getattr(plugin, "_rust_handle", None)
         if handle is None:
             raise click.ClickException("list-records requires the native ESP backend.")
-        matches = plugin.search_records(
-            match_pattern if match_pattern is not None else "*",
-            mode=_resolve_search_mode(mode_substring, mode_regex) if match_pattern is not None else "glob",
-            match_full=match_full if match_pattern is not None else False,
-            read_full=match_full if match_pattern is not None else False,
-            signatures=signatures or None,
-            case_sensitive=case_sensitive if match_pattern is not None else True,
-            limit=None if subrecord_signatures else max_results,
-        )
+        if match_pattern is None or (match_pattern == "*" and not mode_substring and not mode_regex):
+            from creation_lib.esp import native_runtime
+            matches = [{"form_id": row[4], "signature": row[2], "editor_id": row[1] or None}
+                       for row in native_runtime.plugin_handle_record_index_rows(handle, signatures=signatures or None)]
+            if match_full and match_pattern is not None:
+                names = {row["form_id"]: row.get("full_name") for row in plugin.search_records(
+                    "*", match_full=True, read_full=True, signatures=signatures or None)}
+                for match in matches:
+                    match["full_name"] = names.get(match["form_id"])
+        else:
+            matches = plugin.search_records(
+                match_pattern,
+                mode=_resolve_search_mode(mode_substring, mode_regex),
+                match_full=match_full,
+                read_full=match_full,
+                signatures=signatures or None,
+                case_sensitive=case_sensitive,
+                limit=None if subrecord_signatures else max_results,
+            )
         if subrecord_signatures:
             from creation_lib.esp import native_runtime
 
@@ -559,6 +610,117 @@ def list_records(ctx, plugin_path, record_types, match_pattern, mode_substring, 
         output(result, ctx.obj.get("fmt", "json"))
 
 
+@esp.command(name="cell-children")
+@click.argument("plugin_path")
+@click.argument("cell_id")
+@click.option("--temporary-only", is_flag=True, default=False, help="Return only records in the CELL Temporary group (type 9).")
+@click.option("--lazy/--eager", default=True, show_default=True, help="Use the index-only reader for large plugins.")
+@click.option("--strings-dir", default=None, help="Override localized strings directory.")
+@click.option("--language", default=None, help="Preferred localized strings language.")
+@click.pass_context
+def cell_children(ctx, plugin_path, cell_id, temporary_only, lazy, strings_dir, language):
+    """List records nested under a CELL's child group.
+
+    CELL_ID is a local hexadecimal object ID (for example 0036CD) or a CELL
+    EditorID. Results retain each record's immediate group type so callers can
+    distinguish Persistent (8), Temporary (9), and direct type-6 records.
+    """
+    from creation_lib.esp import native_runtime
+
+    plugin_file = Path(plugin_path)
+    if not plugin_file.is_file():
+        raise click.ClickException(f"Plugin not found: {plugin_file}")
+    with _load_plugin(
+        plugin_file,
+        game=ctx.obj.get("game"),
+        strings_dir=strings_dir,
+        language=language,
+        backend="native",
+        lazy_index=lazy,
+    ) as plugin:
+        handle = _require_native(plugin, "cell-children")
+        cell_form_id = _resolve_cell_raw_form_id(handle, cell_id)
+        children = native_runtime.plugin_handle_collect_cell_children(handle, cell_form_id)
+        if temporary_only:
+            children = [child for child in children if int(child.get("group_type", -1)) == 9]
+        output(
+            {
+                "plugin": plugin.plugin_name,
+                "cell_form_id": f"{cell_form_id:08X}",
+                "cell_object_id": f"{cell_form_id & 0x00FFFFFF:06X}",
+                "lazy": lazy,
+                "temporary_only": temporary_only,
+                "count": len(children),
+                "children": children,
+            },
+            ctx.obj.get("fmt", "json"),
+        )
+
+
+@esp.command(name="cell-slice-roots")
+@click.argument("plugin_path")
+@click.argument("worldspace_editor_id")
+@click.option("--min-x", type=int, required=True)
+@click.option("--min-y", type=int, required=True)
+@click.option("--max-x", type=int, required=True)
+@click.option("--max-y", type=int, required=True)
+@click.option(
+    "--include-persistent-cell",
+    is_flag=True,
+    default=False,
+    help="Include the worldspace persistent CELL and its placed children.",
+)
+@click.option("--strings-dir", default=None, help="Override localized strings directory.")
+@click.option("--language", default=None, help="Preferred localized strings language.")
+@click.pass_context
+def cell_slice_roots(
+    ctx,
+    plugin_path,
+    worldspace_editor_id,
+    min_x,
+    min_y,
+    max_x,
+    max_y,
+    include_persistent_cell,
+    strings_dir,
+    language,
+):
+    """Collect CELLs and dependency roots inside one WRLD coordinate slice."""
+    from creation_lib.esp import native_runtime
+
+    plugin_file = Path(plugin_path)
+    if not plugin_file.is_file():
+        raise click.ClickException(f"Plugin not found: {plugin_file}")
+    if min_x > max_x or min_y > max_y:
+        raise click.ClickException("slice minimum coordinates must not exceed maxima")
+    with _load_plugin(
+        plugin_file,
+        game=ctx.obj.get("game"),
+        strings_dir=strings_dir,
+        language=language,
+        backend="native",
+    ) as plugin:
+        handle = _require_native(plugin, "cell-slice-roots")
+        result = native_runtime.plugin_handle_collect_cell_slice_roots(
+            handle,
+            worldspace_editor_id=worldspace_editor_id,
+            min_x=min_x,
+            min_y=min_y,
+            max_x=max_x,
+            max_y=max_y,
+            include_worldspace_persistent_cell=include_persistent_cell,
+        )
+        result["plugin"] = plugin.plugin_name
+        result["worldspace_editor_id"] = worldspace_editor_id
+        result["bounds"] = {
+            "min_x": min_x,
+            "min_y": min_y,
+            "max_x": max_x,
+            "max_y": max_y,
+        }
+        output(result, ctx.obj.get("fmt", "json"))
+
+
 @esp.command(name="collect-assets")
 @click.argument("plugin_path")
 @click.option("--kind", "asset_kinds", multiple=True, help="Asset kind to include, e.g. nif. Repeatable.")
@@ -567,8 +729,9 @@ def list_records(ctx, plugin_path, record_types, match_pattern, mode_substring, 
 @click.option("--strings-dir", default=None, help="Override localized strings directory.")
 @click.option("--language", default=None, help="Preferred localized strings language.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
+@click.option("--full-load", is_flag=True, default=False, help="Load the whole plugin instead of resolving records lazily. Diagnostic escape hatch; slower and far more memory.")
 @click.pass_context
-def collect_assets(ctx, plugin_path, asset_kinds, record_types, form_keys, strings_dir, language, backend):
+def collect_assets(ctx, plugin_path, asset_kinds, record_types, form_keys, strings_dir, language, backend, full_load):
     """Collect asset paths referenced by records in a plugin."""
     from creation_lib.esp import native_runtime
     from creation_lib.esp.record_types import record_type_signature
@@ -587,6 +750,7 @@ def collect_assets(ctx, plugin_path, asset_kinds, record_types, form_keys, strin
         strings_dir=strings_dir,
         language=language,
         backend=backend,
+        lazy_index=not full_load,
     ) as plugin:
         handle = getattr(plugin, "_rust_handle", None)
         if handle is None:
@@ -618,8 +782,9 @@ def collect_assets(ctx, plugin_path, asset_kinds, record_types, form_keys, strin
 @click.option("--strings-dir", default=None, help="Override localized strings directory.")
 @click.option("--language", default=None, help="Preferred localized strings language.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
+@click.option("--full-load", is_flag=True, default=False, help="Load the whole plugin instead of resolving records lazily. Diagnostic escape hatch; slower and far more memory.")
 @click.pass_context
-def search(ctx, plugin_path, pattern, mode_substring, mode_regex, match_full, record_type, case_sensitive, limit, detail, strings_dir, language, backend):
+def search(ctx, plugin_path, pattern, mode_substring, mode_regex, match_full, record_type, case_sensitive, limit, detail, strings_dir, language, backend, full_load):
     """Search records by EditorID with glob/substring/regex matching.
 
     PATTERN is a shell-style glob by default (e.g. '*Plasma*', 'B21_??Gun'). Use
@@ -637,6 +802,7 @@ def search(ctx, plugin_path, pattern, mode_substring, mode_regex, match_full, re
         strings_dir=strings_dir,
         language=language,
         backend=backend,
+        lazy_index=not full_load,
     ) as plugin:
         if getattr(plugin, "_rust_handle", None) is None:
             raise click.ClickException("search requires the native ESP backend.")
@@ -668,8 +834,9 @@ def search(ctx, plugin_path, pattern, mode_substring, mode_regex, match_full, re
 @click.option("--strings-dir", default=None, help="Override localized strings directory.")
 @click.option("--language", default=None, help="Preferred localized strings language.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
+@click.option("--full-load", is_flag=True, default=False, help="Load the whole plugin instead of resolving records lazily. Diagnostic escape hatch; slower and far more memory.")
 @click.pass_context
-def get_record(ctx, plugin_path, record_id, authoring, strings_dir, language, backend):
+def get_record(ctx, plugin_path, record_id, authoring, strings_dir, language, backend, full_load):
     """Dump a single record as a JSON object.
 
     RECORD_ID is an EditorID or a plugin-local FormID in hex (e.g. 000800).
@@ -688,6 +855,7 @@ def get_record(ctx, plugin_path, record_id, authoring, strings_dir, language, ba
         strings_dir=strings_dir,
         language=language,
         backend=backend,
+        lazy_index=not full_load,
     ) as plugin:
         handle = getattr(plugin, "_rust_handle", None)
         if handle is None:
@@ -718,8 +886,9 @@ def get_record(ctx, plugin_path, record_id, authoring, strings_dir, language, ba
 @click.option("--strings-dir", default=None, help="Override localized strings directory.")
 @click.option("--language", default=None, help="Preferred localized strings language.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
+@click.option("--full-load", is_flag=True, default=False, help="Load the whole plugin instead of resolving records lazily. Diagnostic escape hatch; slower and far more memory.")
 @click.pass_context
-def get_records(ctx, plugin_path, record_ids, authoring, strings_dir, language, backend):
+def get_records(ctx, plugin_path, record_ids, authoring, strings_dir, language, backend, full_load):
     """Dump multiple records while opening PLUGIN_PATH only once.
 
     RECORD_IDS are EditorIDs or plugin-local FormIDs in hex. Missing records are
@@ -738,6 +907,7 @@ def get_records(ctx, plugin_path, record_ids, authoring, strings_dir, language, 
         strings_dir=strings_dir,
         language=language,
         backend=backend,
+        lazy_index=not full_load,
     ) as plugin:
         handle = getattr(plugin, "_rust_handle", None)
         if handle is None:
@@ -1214,9 +1384,14 @@ def _subrecord_delta(a_json: dict, b_json: dict) -> dict:
 @click.argument("plugin_b")
 @click.option("--detail", is_flag=True, default=False, help="Also report per-subrecord deltas for changed records.")
 @click.option("--type", "record_type", default=None, help="Restrict the diff to a record type, e.g. WEAP.")
+@click.option("--semantic", is_flag=True, help="Compare decoded field paths and values.")
+@click.option("--record", "record_ids", multiple=True, help="Semantic diff: only these EditorIDs or local hex IDs.")
+@click.option("--field", "fields", multiple=True, help="Semantic diff: include this dotted path/prefix/glob.")
+@click.option("--exclude", multiple=True, help="Semantic diff: ignore this dotted path/prefix/glob.")
+@click.option("--normalize-references/--raw-references", default=True, help="Semantic diff: canonicalize structured FormKeys and self-plugin names.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
 @click.pass_context
-def diff(ctx, plugin_a, plugin_b, detail, record_type, backend):
+def diff(ctx, plugin_a, plugin_b, detail, record_type, semantic, record_ids, fields, exclude, normalize_references, backend):
     """Record-level diff of PLUGIN_A and PLUGIN_B (read-only).
 
     Reports records added (in B only), removed (in A only), and changed (in both,
@@ -1231,6 +1406,11 @@ def diff(ctx, plugin_a, plugin_b, detail, record_type, backend):
         raise click.ClickException(f"Plugin not found: {a_file}")
     if not b_file.is_file():
         raise click.ClickException(f"Plugin not found: {b_file}")
+    if semantic:
+        from cli.inspection_commands import semantic_diff
+        return semantic_diff(ctx, a_file, b_file, record_type, record_ids, fields, exclude, normalize_references)
+    if record_ids or fields or exclude:
+        raise click.UsageError("--record, --field and --exclude require --semantic")
     game = ctx.obj.get("game")
     with _load_plugin(a_file, game=game, strings_dir=None, language=None, backend=backend) as plugin_a_obj, \
          _load_plugin(b_file, game=game, strings_dir=None, language=None, backend=backend) as plugin_b_obj:
@@ -1701,12 +1881,13 @@ def clean(ctx, plugin_path, do_itm, do_udr, dry_run, output_path):
 @click.option("--strings-dir", default=None, help="Override localized strings directory.")
 @click.option("--language", default=None, help="Preferred localized strings language.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
+@click.option("--full-load", is_flag=True, default=False, help="Load the whole plugin instead of resolving records lazily. Diagnostic escape hatch; slower and far more memory.")
 @click.pass_context
-def count(ctx, plugin_path, match_pattern, mode_substring, mode_regex, match_full, record_type, case_sensitive, strings_dir, language, backend):
+def count(ctx, plugin_path, match_pattern, mode_substring, mode_regex, match_full, record_type, case_sensitive, strings_dir, language, backend, full_load):
     """Report record counts: total, per-signature breakdown, and an optional --match count.
 
-    The total and per-signature breakdown come from the group index (no record
-    materialization); --match adds an O(records) pattern scan (see `esp search`).
+    Totals include records in nested groups. Only headers are scanned;
+    --match also scans EditorIDs (see `esp search`).
     """
     from creation_lib.esp.record_types import record_type_signature
 
@@ -1720,11 +1901,13 @@ def count(ctx, plugin_path, match_pattern, mode_substring, mode_regex, match_ful
         strings_dir=strings_dir,
         language=language,
         backend=backend,
+        lazy_index=not full_load,
     ) as plugin:
         if getattr(plugin, "_rust_handle", None) is None:
             raise click.ClickException("count requires the native ESP backend.")
-        sig_counts = {str(sig): int(c) for sig, c in plugin.group_signatures}
-        result = {"plugin": plugin.plugin_name, "record_count": plugin.record_count}
+        from creation_lib.esp import native_runtime
+        sig_counts = native_runtime.plugin_handle_record_counts(plugin._rust_handle)
+        result = {"plugin": plugin.plugin_name, "record_count": sum(sig_counts.values())}
         sig = record_type_signature(record_type) if record_type else None
         if sig:
             result["type"] = sig
@@ -2061,13 +2244,15 @@ def delete_matching(ctx, plugin_path, match_pattern, mode_substring, mode_regex,
 @click.argument("plugin_path")
 @click.option("--base-type", "base_types", multiple=True, help="Base record signature to delete placements for, e.g. ACTI. Repeat for multiple; use ALL for every placed record.")
 @click.option("--race", "race_specs", multiple=True, help="Only delete placed actor refs whose base NPC_ RACE matches: a form key (Fallout4.esm:013746), an alias (HumanRace/GhoulRace), or a RACE EditorID in this plugin. Repeatable. Implies --base-type NPC_ and scopes the scan to ACHR.")
+@click.option("--worldspace", default=None, help="Restrict the census/deletion to one exterior WRLD EditorID, including its persistent cell.")
+@click.option("--details", is_flag=True, default=False, help="Include matched base records, model paths, placement counts, and sample placed FormIDs.")
 @click.option("--dry-run", is_flag=True, default=False, help="Report what would be deleted without saving.")
 @click.option("--output", "output_path", default=None, help="Write the modified plugin here instead of overwriting PLUGIN_PATH.")
 @click.option("--strings-dir", default=None, help="Override localized strings directory.")
 @click.option("--language", default=None, help="Preferred localized strings language.")
 @click.option("--backend", type=click.Choice(["auto", "native", "python"]), default="auto", show_default=True, help="ESP runtime backend.")
 @click.pass_context
-def delete_placed_by_base(ctx, plugin_path, base_types, race_specs, dry_run, output_path, strings_dir, language, backend):
+def delete_placed_by_base(ctx, plugin_path, base_types, race_specs, worldspace, details, dry_run, output_path, strings_dir, language, backend):
     """Delete placed refs whose NAME base resolves to the requested base type.
 
     With --race, restrict to placed actors (ACHR) whose base NPC_ uses a matching
@@ -2114,16 +2299,36 @@ def delete_placed_by_base(ctx, plugin_path, base_types, race_specs, dry_run, out
             raise click.ClickException("delete-placed-by-base requires the native ESP backend.")
         own_plugin = plugin.plugin_name.lower()
         race_filter = _resolve_race_specs(plugin, handle, race_filter_specs) if race_filter_specs else {}
-        # Race filtering only concerns placed actors, so scan ACHR alone — far
-        # cheaper than resolving NAME for every REFR on a 1 GB master.
-        scan_signatures = ["ACHR"] if race_filter_specs else list(_PLACED_RECORD_SIGNATURES)
-        placed_ids = native_runtime.plugin_handle_record_form_ids(handle, scan_signatures)
+        if worldspace:
+            roots = native_runtime.plugin_handle_collect_cell_slice_roots(
+                handle,
+                worldspace_editor_id=worldspace,
+                min_x=-(2**31),
+                min_y=-(2**31),
+                max_x=2**31 - 1,
+                max_y=2**31 - 1,
+                include_worldspace_persistent_cell=True,
+            )
+            if not roots.get("worldspace_form_keys"):
+                warnings = "; ".join(str(value) for value in roots.get("warnings", []))
+                raise click.ClickException(warnings or f"Worldspace not found: {worldspace}")
+            placed_ids = [
+                object_id
+                for form_key in roots.get("placed_form_keys", [])
+                if (object_id := _form_key_object_id(form_key)) is not None
+            ]
+        else:
+            # Race filtering only concerns placed actors, so scan ACHR alone — far
+            # cheaper than resolving NAME for every REFR on a 1 GB master.
+            scan_signatures = ["ACHR"] if race_filter_specs else list(_PLACED_RECORD_SIGNATURES)
+            placed_ids = native_runtime.plugin_handle_record_form_ids(handle, scan_signatures)
         xloc_form_ids = set(
             native_runtime.plugin_handle_record_form_ids_with_subrecords(handle, ["XLOC"])
         )
         matched: list[int] = []
         matched_base_keys: dict[int, str] = {}
         matched_race_keys: dict[int, str] = {}
+        matched_base_records: dict[str, dict[str, object]] = {}
         by_base: dict[str, dict[str, int]] = {
             sig: {"matched": 0, "with_lock_data": 0, "deleted": 0}
             for sig in sorted(requested_set)
@@ -2139,6 +2344,8 @@ def delete_placed_by_base(ctx, plugin_path, base_types, race_specs, dry_run, out
         missing_name = 0
         for form_id in placed_ids:
             summary = native_runtime.plugin_handle_record_summary(handle, form_id)
+            if race_filter_specs and (summary is None or summary.signature != "ACHR"):
+                continue
             if summary is not None and summary.signature in placed_signature_counts:
                 placed_signature_counts[summary.signature] += 1
             base_signature = None
@@ -2207,6 +2414,15 @@ def delete_placed_by_base(ctx, plugin_path, base_types, race_specs, dry_run, out
                     levels[level] = levels.get(level, 0) + 1
             matched.append(form_id)
             matched_base_keys[form_id] = base_key
+            if details and base_form_key is not None:
+                base_counts = matched_base_records.setdefault(
+                    base_form_key,
+                    {"placement_count": 0, "sample_placed_form_ids": []},
+                )
+                base_counts["placement_count"] += 1
+                sample_form_ids = base_counts["sample_placed_form_ids"]
+                if len(sample_form_ids) < 10:
+                    sample_form_ids.append(f"{form_id & 0x00FFFFFF:06X}")
             if race_key is not None:
                 by_race.setdefault(race_key, {"matched": 0, "deleted": 0})["matched"] += 1
                 matched_race_keys[form_id] = race_key
@@ -2246,8 +2462,35 @@ def delete_placed_by_base(ctx, plugin_path, base_types, race_specs, dry_run, out
                 }
             )
         locked_base_records.sort(key=lambda row: (-row["count"], row["form_key"]))
+        detailed_base_records = []
+        for base_form_key, counts in matched_base_records.items():
+            object_id = _form_key_object_id(base_form_key)
+            summary = (
+                None
+                if object_id is None
+                else native_runtime.plugin_handle_record_summary(handle, object_id)
+            )
+            detailed_base_records.append(
+                {
+                    "form_key": base_form_key,
+                    "editor_id": None if summary is None else summary.editor_id,
+                    "signature": None if summary is None else summary.signature,
+                    "model_paths": (
+                        []
+                        if object_id is None
+                        else _record_model_paths(
+                            native_runtime.plugin_handle_record_subrecords(handle, object_id)
+                        )
+                    ),
+                    **counts,
+                }
+            )
+        detailed_base_records.sort(
+            key=lambda row: (-row["placement_count"], row["form_key"])
+        )
         result = {
             "plugin": plugin.plugin_name,
+            "worldspace": worldspace,
             "base_types": ["ALL"] if delete_all else sorted(requested_set),
             "placed_scanned": len(placed_ids),
             "placed_with_lock_data": len(xloc_form_ids),
@@ -2263,6 +2506,7 @@ def delete_placed_by_base(ctx, plugin_path, base_types, race_specs, dry_run, out
                 )
             ],
             "locked_base_records": locked_base_records,
+            "matched_base_records": detailed_base_records,
             "deleted": deleted,
             "dry_run": dry_run,
             "output": str(target),
@@ -2308,11 +2552,35 @@ def _resolve_cell_object_id(handle, plugin, cell_id: str) -> int:
         return int(text, 16) & 0x00FFFFFF
     except ValueError:
         pass
-    for fid in native_runtime.plugin_handle_record_form_ids(handle, ["CELL"]):
-        summary = native_runtime.plugin_handle_record_summary(handle, fid)
-        if summary is not None and summary.editor_id and summary.editor_id.lower() == text.lower():
-            return fid & 0x00FFFFFF
+    for _form_key, editor_id, _signature, object_id, _raw_form_id in (
+        native_runtime.plugin_handle_record_index_rows(handle, signatures=["CELL"])
+    ):
+        if editor_id and editor_id.lower() == text.lower():
+            return object_id & 0x00FFFFFF
     raise click.ClickException(f"Could not resolve CELL '{cell_id}' (pass a local hex FormID like 6240BB or a CELL EditorID).")
+
+
+def _resolve_cell_raw_form_id(handle, cell_id: str) -> int:
+    from creation_lib.esp import native_runtime
+
+    text = str(cell_id).strip()
+    rows = native_runtime.plugin_handle_record_index_rows(handle, signatures=["CELL"])
+    try:
+        parsed = int(text, 16) & 0xFFFFFFFF
+    except ValueError:
+        matches = [row for row in rows if row[1] and row[1].lower() == text.lower()]
+    else:
+        if len(text.removeprefix("0x")) > 6:
+            return parsed
+        matches = [row for row in rows if row[3] == parsed]
+    if len(matches) == 1:
+        return matches[0][4]
+    if len(matches) > 1:
+        choices = ", ".join(f"{row[4]:08X}" for row in matches[:8])
+        raise click.ClickException(f"CELL '{cell_id}' is ambiguous; pass one of these raw FormIDs: {choices}")
+    raise click.ClickException(
+        f"Could not resolve CELL '{cell_id}' (pass a local/raw hex FormID or a CELL EditorID)."
+    )
 
 
 def _resolve_raw_edit_record_form_id(plugin, handle, record_id: str, signatures: list[str] | None) -> int:
@@ -2554,6 +2822,57 @@ def retain_race_subgraphs(ctx, plugin_path, record_id, selector_object_id, edito
 
 
 _QUEST_START_GAME_ENABLED_FLAG = 0x0001
+
+
+@esp.command(name="audit-fnv-quests")
+@click.argument(
+    "plugin_paths",
+    nargs=-1,
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+)
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Write the deterministic quest-foundation manifest to this JSON file.",
+)
+@click.option(
+    "--max-closure-records",
+    type=click.IntRange(min=1),
+    default=100_000,
+    show_default=True,
+    help="Fail-closed traversal cap for the shared quest dependency closure.",
+)
+@click.pass_context
+def audit_fnv_quests(ctx, plugin_paths, report_path, max_closure_records):
+    """Inventory every FNV quest and its startup/dependency evidence."""
+    from contextlib import ExitStack
+
+    from bacup_lib.fnv_quest_foundation import audit_fnv_quest_plugins
+
+    with ExitStack() as stack:
+        plugins = [
+            stack.enter_context(
+                _load_plugin(
+                    plugin_path,
+                    game="fnv",
+                    strings_dir=None,
+                    language=None,
+                    backend="native",
+                )
+            )
+            for plugin_path in plugin_paths
+        ]
+        report = audit_fnv_quest_plugins(
+            plugins, max_closure_records=max_closure_records
+        )
+    payload = report.to_dict()
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(report.to_json() + "\n", encoding="utf-8")
+    output(payload, ctx.obj.get("fmt", "json"))
 
 
 def _clear_quest_start_game_enabled(subrecords):
@@ -3532,7 +3851,7 @@ def check_errors(ctx, plugin_path, no_fail, max_errors):
 @click.option("--max-hazards", type=click.IntRange(min=1), default=None, help="Maximum hazards to include in output.")
 @click.option(
     "--profile",
-    type=click.Choice(["fo76-to-fo4"]),
+    type=click.Choice(["fo76-to-fo4", "fo4-target-shape"]),
     default="fo76-to-fo4",
     show_default=True,
     help="Runtime-hazard rule profile to apply.",

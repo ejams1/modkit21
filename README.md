@@ -8,12 +8,12 @@ The project is Windows-first and centers on Fallout 4 workflows, with
 read/reference support for Fallout 76, Skyrim Special Edition, Starfield,
 Fallout 3, and Fallout: New Vegas.
 
-Cross-game conversion — a framework for porting records and assets between
-Creation Engine games, with Fallout 76 -> Fallout 4 as its most complete
-pipeline — lives in the sibling [bacup](https://github.com/Bryant-21/bacup)
-app. The shared record/NIF/archive/material engine both apps build on lives
-in [py-creation-lib](https://github.com/Bryant-21/py-creation-lib), which
-this repo pulls in as a submodule.
+Cross-game conversion (porting records and assets between Creation Engine
+games; Fallout 76 -> Fallout 4 is the most complete pair) lives in the sibling
+[bacup](https://github.com/Bryant-21/bacup) app. Both apps build on the shared
+record/NIF/archive/material engine in
+[py-creation-lib](https://github.com/Bryant-21/py-creation-lib), included here
+as a submodule.
 
 ## Contents
 
@@ -35,10 +35,10 @@ this repo pulls in as a submodule.
   commands, game data search, ESP/ESM/ESL authoring, NIF editing, archive
   work, SWF/Pipboy icon tools, Havok cloth, Creation Kit automation, and
   index building — see [modkit CLI](#modkit-cli) for the full reference.
-- **Desktop toolkit**: `app.py` launches the ModBox21 desktop app — a
-  single ImGui shell hosting 42 switchable workspaces spanning mod building,
+- **Desktop toolkit**: `app.py` launches the ModBox21 desktop app, a
+  single ImGui shell hosting 42 switchable workspaces for mod building,
   NIF/mesh editing, ESP editing, materials/textures, audio tools,
-  animation/Havok, worldspace/LOD generation, and asset utilities — see
+  animation/Havok, worldspace/LOD generation, and asset utilities. See
   [Desktop Workspaces](#desktop-workspaces) for the full list.
 - **Native ESP pipeline**: plugin authoring is binary-first and
   native-backed through `creation_lib._native`. Authoring directories under
@@ -135,9 +135,9 @@ build with:
      once a screenshot exists. -->
 
 `app.py` launches a single ImGui shell (`ui/toolkit/`) that hosts all 42
-workspaces below as switchable tabs in one shared docking layout — only one
-workspace is active at a time, and its panels replace the previous
-workspace's in the same left/center/right/bottom docks.
+workspaces below as switchable tabs in one shared docking layout. One
+workspace is active at a time; its panels replace the previous workspace's
+in the same left/center/right/bottom docks.
 
 ### Core Workspaces
 
@@ -496,8 +496,7 @@ not a group):
 
 ### Command Reference
 
-Every subcommand, grouped the same way. Each block is collapsed by default
-— click a group to expand it.
+Every subcommand, grouped the same way. Click a group to expand it.
 
 <details>
 <summary><code>data</code> — 18 subcommands</summary>
@@ -740,7 +739,7 @@ Every subcommand, grouped the same way. Each block is collapsed by default
 
 | Command | Purpose |
 | --- | --- |
-| `git commit` | Stage all changes, commit, and push |
+| `git commit` | Commit the given paths (or `--all`) and push unless `--no-push` |
 | `git push` | Push to remote |
 | `git pull` | Pull the latest changes from origin |
 | `git checkout` | Discard all local changes (hard reset + clean) |

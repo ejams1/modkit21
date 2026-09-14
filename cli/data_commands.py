@@ -34,7 +34,7 @@ def result_options(f):
 
 @click.group()
 @click.option("--game", default=None, help="Game profile (overrides global --game).")
-@click.option("--format", "fmt", type=click.Choice(["json", "pretty", "compact", "table"]), default=None, help="Output format (overrides global --format).")
+@click.option("--format", "fmt", type=click.Choice(["json", "pretty", "compact", "table", "jsonl"]), default=None, help="Output format (overrides global --format).")
 @click.pass_context
 def data(ctx, game, fmt):
     """Search and query Bethesda game data — records, scripts, wiki, behaviors, NIFs."""
@@ -42,6 +42,19 @@ def data(ctx, game, fmt):
         ctx.obj["game"] = game
     if fmt is not None:
         ctx.obj["fmt"] = fmt
+
+
+@data.command("schema")
+@click.argument("field")
+@click.option("--form-version", type=click.IntRange(0, 65535), default=None)
+@click.pass_context
+def schema(ctx, field, form_version):
+    """Show native schema offsets and widths for SIG.SUB, e.g. RACE.DATA."""
+    from creation_lib.esp.native_runtime import schema_field_layout
+    parts = field.upper().split(".")
+    if len(parts) != 2 or any(len(part) != 4 or not part.isascii() for part in parts):
+        raise click.UsageError("Expected SIG.SUB, for example RACE.DATA")
+    output(schema_field_layout(ctx.obj["game"], *parts, form_version), ctx.obj["fmt"], collection="fields")
 
 
 @data.command()
@@ -149,8 +162,18 @@ def list_cmd(ctx, domain, record_type, source, category, extends, mod_name, exte
     output(result, fmt)
 
 
+def _validate_data_form_key(ctx, param, value):
+    import re
+    if value:
+        match = re.fullmatch(r"(.+\.es[mpl]):((?:0x)?[0-9a-f]+)", value, re.IGNORECASE)
+        if match:
+            plugin, object_id = match.groups()
+            raise click.BadParameter(f"FormKey parts are reversed; use '{object_id}:{plugin}' (ObjectID:Plugin).", ctx=ctx, param=param)
+    return value
+
+
 @data.command()
-@click.argument("form_key")
+@click.argument("form_key", callback=_validate_data_form_key)
 @click.option("--content", "include_content", is_flag=True, help="Include full YAML content")
 @click.pass_context
 def record(ctx, form_key, include_content):
@@ -168,7 +191,7 @@ def record(ctx, form_key, include_content):
 
 
 @data.command()
-@click.argument("form_key")
+@click.argument("form_key", callback=_validate_data_form_key)
 @click.option("-t", "--type", "record_type", default="", help="Filter by record type")
 @result_options
 @click.pass_context
@@ -221,7 +244,7 @@ def keyword(ctx, keyword, record_type, max_results):
 
 
 @data.command()
-@click.argument("form_key")
+@click.argument("form_key", callback=_validate_data_form_key)
 @click.pass_context
 def keywords(ctx, form_key):
     """Get all keywords for a record, resolved to EditorIDs.
@@ -236,7 +259,7 @@ def keywords(ctx, form_key):
 
 
 @data.command("count-refs")
-@click.argument("form_key")
+@click.argument("form_key", callback=_validate_data_form_key)
 @click.pass_context
 def count_refs(ctx, form_key):
     """Count references to a FormKey (fast).
@@ -350,102 +373,43 @@ def batch(ctx, commands_json):
 
 @data.command()
 @click.argument("mod_name")
-@click.option("--asset", "asset_path", default="", help="Asset path to trace (partial match OK).")
-@click.option("--record", "record_fk", default="", help="FormKey of record to trace (partial match OK).")
+@click.option("--asset", "asset_path", default="", help="Asset path substring to trace.")
+@click.option("--record", "record_fk", default="", help="FormKey or EditorID substring to trace.")
 @click.pass_context
 def trace(ctx, mod_name, asset_path, record_fk):
-    """Print provenance ancestry for an asset or record in a converted mod.
-
-    Reads asset_provenance.jsonl / record_provenance.jsonl written alongside
-    conversion_log.txt in the mod output folder.
-
-    Examples:
-
-      modkit data trace B21_Converted_meltdown_Batch --asset scorchbeast
-      modkit data trace B21_Converted_meltdown_Batch --record 6F5790
-    """
-    import os
-
+    """Read conversion provenance as structured records or an asset-owner summary."""
+    from collections import Counter
     from app.paths import get_app_root
-    mod_dir = str(get_app_root() / "mods" / mod_name)
-    if not os.path.isdir(mod_dir):
-        print(f"Error: mod directory not found: {mod_dir}", file=sys.stderr)
-        sys.exit(1)
 
-    if asset_path:
-        prov_file = os.path.join(mod_dir, "asset_provenance.jsonl")
-        if not os.path.isfile(prov_file):
-            print(f"Error: {prov_file} not found — run conversion first.", file=sys.stderr)
-            sys.exit(1)
-        query = asset_path.lower()
-        matches = []
-        with open(prov_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+    if asset_path and record_fk:
+        raise click.UsageError("--asset and --record are mutually exclusive")
+    root = (get_app_root() / "mods").resolve()
+    mod_dir = (root / mod_name).resolve()
+    if not mod_dir.is_relative_to(root):
+        raise click.BadParameter("Mod name must stay inside mods/", param_hint="mod_name")
+    if not mod_dir.is_dir():
+        raise click.ClickException(f"Mod directory not found: {mod_dir}")
+    path = mod_dir / ("record_provenance.jsonl" if record_fk else "asset_provenance.jsonl")
+    if not path.is_file():
+        raise click.ClickException(f"{path} not found — run conversion first.")
+    matches, counts = [], Counter()
+    query = (asset_path or record_fk).casefold()
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
                 entry = json.loads(line)
-                if query in entry.get("asset_path", "").lower():
+            except json.JSONDecodeError as error:
+                raise click.ClickException(f"{path}:{line_number}: {error.msg}") from error
+            if query:
+                keys = ("asset_path",) if asset_path else ("form_key", "editor_id")
+                if any(query in str(entry.get(key) or "").casefold() for key in keys):
                     matches.append(entry)
-        if not matches:
-            print(f"No assets matching '{asset_path}' found in provenance log.")
-        else:
-            print(f"Found {len(matches)} matching asset(s):\n")
-            for m in matches:
-                print(f"  asset_path:     {m.get('asset_path')}")
-                print(f"  asset_type:     {m.get('asset_type')}")
-                print(f"  added_by:       {m.get('added_by_record_eid')} ({m.get('added_by_record_fk')})")
-                print(f"  field:          {m.get('added_by_field')}")
-                print(f"  walk_depth:     {m.get('walk_depth')}")
-                print(f"  walker_pass:    {m.get('walker_pass')}")
-                print()
-
-    elif record_fk:
-        prov_file = os.path.join(mod_dir, "record_provenance.jsonl")
-        if not os.path.isfile(prov_file):
-            print(f"Error: {prov_file} not found — run conversion first.", file=sys.stderr)
-            sys.exit(1)
-        query = record_fk.lower()
-        matches = []
-        with open(prov_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                entry = json.loads(line)
-                if query in entry.get("form_key", "").lower() or query in entry.get("editor_id", "").lower():
-                    matches.append(entry)
-        if not matches:
-            print(f"No records matching '{record_fk}' found in provenance log.")
-        else:
-            print(f"Found {len(matches)} matching record(s):\n")
-            for m in matches:
-                print(f"  form_key:       {m.get('form_key')}")
-                print(f"  editor_id:      {m.get('editor_id')}")
-                print(f"  record_type:    {m.get('record_type')}")
-                print(f"  added_by:       {m.get('added_by_record_eid')} ({m.get('added_by_record_fk')})")
-                print(f"  field:          {m.get('added_by_field')}")
-                print(f"  walk_depth:     {m.get('walk_depth')}")
-                print(f"  walker_pass:    {m.get('walker_pass')}")
-                print()
-    else:
-        # No filter — show full summary from conversion_log.txt ancestor section
-        prov_file = os.path.join(mod_dir, "asset_provenance.jsonl")
-        if not os.path.isfile(prov_file):
-            print(f"Error: {prov_file} not found — run conversion first.", file=sys.stderr)
-            sys.exit(1)
-        counts: dict[str, int] = {}
-        with open(prov_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                entry = json.loads(line)
-                eid = entry.get("added_by_record_eid") or "(unknown)"
-                fk = entry.get("added_by_record_fk") or ""
-                label = f"{eid} ({fk})" if fk else eid
-                counts[label] = counts.get(label, 0) + 1
-        print(f"Asset provenance summary for {mod_name}:\n")
-        for label, count in sorted(counts.items(), key=lambda kv: -kv[1]):
-            flag = "  <-- REVIEW" if count > 10 else ""
-            print(f"  {count:4d}  {label}{flag}")
+            else:
+                counts[(entry.get("added_by_record_eid") or "(unknown)", entry.get("added_by_record_fk") or "")] += 1
+    if not query:
+        matches = [{"editor_id": eid, "form_key": fk, "asset_count": count}
+                   for (eid, fk), count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+    output({"mod": mod_name, "provenance_file": str(path), "mode": "records" if record_fk else "assets" if asset_path else "summary",
+            "matches": matches}, ctx.obj["fmt"], collection="matches")

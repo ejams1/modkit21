@@ -63,6 +63,10 @@ ui_mods = collect_submodules(
     filter=lambda name: ".tests" not in name
     and not name.rsplit(".", 1)[-1].startswith("test"),
 )
+ui_datas = collect_data_files(
+    "ui", include_py_files=True,
+    excludes=["**/__pycache__/**", "**/tests/**", "**/*.pyc", "**/*.pyo"],
+)
 
 # File watchers are imported by lazily loaded UI workspaces.
 watchdog_mods = collect_submodules("watchdog")
@@ -136,7 +140,7 @@ a = Analysis(
         *creation_resource_datas,
         ("py_creation_lib/python/creation_lib/renderer/shaders", "creation_lib/renderer/shaders"),
         ("py_creation_lib/python/creation_lib/renderer/assets", "creation_lib/renderer/assets"),
-        ("ui", "ui"),
+        *ui_datas,
         *([ ("configs", "configs") ] if os.path.isdir("configs") else []),
         ("VERSION", "."),
         *onefile_resource_datas,

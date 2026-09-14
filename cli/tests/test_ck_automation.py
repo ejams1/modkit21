@@ -1,4 +1,9 @@
+import inspect
 from pathlib import Path
+from types import SimpleNamespace
+
+import click
+import pytest
 
 from click.testing import CliRunner
 
@@ -23,8 +28,10 @@ def test_ck_animdata_uses_standard_deploy_before_generation(tmp_path, monkeypatc
     (stale_animtext / "stale.txt").write_text("old", encoding="utf-8")
 
     calls: list[tuple[str, dict]] = []
+    deploy_signature = inspect.signature(deployer.deploy_mod)
 
     def fake_deploy_mod(name, **kwargs):
+        deploy_signature.bind(name, **kwargs)
         assert not stale_animtext.exists()
         calls.append(("deploy", {"name": name, **kwargs}))
 
@@ -56,6 +63,34 @@ def test_ck_animdata_uses_standard_deploy_before_generation(tmp_path, monkeypatc
     assert calls[1][1]["game"] == "fo4"
     assert calls[2][1]["game_data_dir"] == game_data_dir
     assert calls[2][1]["deploy_loose_data"] is False
+
+
+@pytest.mark.parametrize("severity", ["warning", "error"])
+def test_animdata_validation_warns_but_only_errors_block(monkeypatch, capsys, severity):
+    from cli import ck_commands, esp_commands
+    from creation_lib.esp import editor
+
+    closed = []
+    session = SimpleNamespace(
+        load=lambda *_args, **_kwargs: SimpleNamespace(handle=1),
+        close_all=lambda: closed.append(True),
+    )
+    issue = SimpleNamespace(
+        severity=SimpleNamespace(value=severity),
+        message="fixture issue",
+        form_id=0x800,
+        plugin_name="B21_Test.esp",
+    )
+    monkeypatch.setattr(editor, "EditorSession", lambda **_kwargs: session)
+    monkeypatch.setattr(editor, "validate", lambda *_args, **_kwargs: [issue])
+    monkeypatch.setattr(esp_commands, "_esp_master_search_paths", lambda *_args: [])
+    if severity == "error":
+        with pytest.raises(click.ClickException, match="ESP validation failed.*"):
+            ck_commands._check_plugin_errors_before_animdata(Path("B21_Test.esp"), "fo4")
+    else:
+        ck_commands._check_plugin_errors_before_animdata(Path("B21_Test.esp"), "fo4")
+        assert "WARNING: fixture issue" in capsys.readouterr().out
+    assert closed == [True]
 
 
 def test_loose_data_deploy_overwrites_stale_files_and_restores_them(tmp_path):

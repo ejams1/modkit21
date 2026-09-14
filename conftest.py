@@ -1,22 +1,14 @@
 """Repo-root pytest configuration — suite-wide safety guards.
 
-A native OS file/folder dialog opening during a test run is always a bug: on a
-headless CI runner the dialog never closes, so the run blocks in
-``pick_folder._wait`` until the job's timeout kills it. This autouse fixture
-replaces the pfd-backed picker helpers in ``creation_lib.ui.widgets.pick_folder``
-with functions that raise, so any test that reaches a real dialog fails fast
-instead of hanging.
+A native file/folder dialog opening during a test is always a bug: on a headless
+CI runner it never closes, so the run blocks in ``pick_folder._wait`` until the
+job times out. The autouse fixture replaces the pfd-backed helpers in
+``creation_lib.ui.widgets.pick_folder`` with functions that raise.
 
-The helpers must be patched on the actual submodule object: the ``widgets``
-package re-exports ``pick_folder``/``pick_file``/``pick_save_file`` as names, so
-the dotted path ``creation_lib.ui.widgets.pick_folder`` resolves to the *function*
-via attribute lookup — ``import_module`` returns the module regardless. Callers
-do ``from creation_lib.ui.widgets.pick_folder import pick_file`` at call time, so
-patching the module attribute is what they pick up.
-
-Patching runs during fixture setup via ``monkeypatch``; a test that legitimately
-drives these helpers and patches them itself layers on top of this guard and is
-restored afterwards.
+The patch targets the submodule from ``import_module``: the ``widgets`` package
+re-exports the helpers as names, so attribute lookup on the dotted path returns
+the function. Callers import the helpers at call time, so they see the patch.
+Tests that patch these helpers themselves layer on top and are restored after.
 """
 import importlib
 

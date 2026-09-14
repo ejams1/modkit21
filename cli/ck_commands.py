@@ -61,6 +61,10 @@ def _check_plugin_errors_before_animdata(plugin_file: "Path", game: str) -> None
     try:
         loaded = session.load(plugin_file, game=game)
         report = validate(session, handle=loaded.handle)
+        for issue in report:
+            if issue.severity.value != "error":
+                click.echo(f"{issue.severity.value.upper()}: {issue.message}")
+        report = [issue for issue in report if issue.severity.value == "error"]
         if report:
             lines = []
             for issue in list(report)[:10]:
@@ -169,7 +173,7 @@ def animdata(ctx, name):
     resolve the same plugin and archives used in-game, then runs
     CK -GenerateAnimInfo.
     """
-    from app.paths import get_app_root, get_db_dir, get_resource_dir
+    from app.paths import get_app_root, get_resource_dir
     from creation_lib.build.deployer import deploy_mod
     from creation_lib.ck.automation import generate_anim_data
 
@@ -197,7 +201,6 @@ def animdata(ctx, name):
             no_esp=False,
             xbox=False,
             project_root=get_app_root(),
-            db_dir=get_db_dir(),
             resource_dir=get_resource_dir(),
             on_progress=click.echo,
         )

@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from app.env_sync import ENV_KEY_MAP, export_settings_to_env, parse_env_file
 from creation_lib.core.game_profiles import GAME_PROFILES
-from ui.toolkit.path_detector import detect_game_path, validate_game_path
+from creation_lib.core.path_detector import detect_game_path, validate_game_path
 from ui.toolkit.settings import ToolkitSettings
 
 

@@ -52,13 +52,11 @@ def test_cloth_pack_round_trips(tmp_path: Path):
     """Extract blob then re-pack unchanged; resulting NIF must be BYTE-IDENTICAL to original."""
     nif = _bathrobe_or_skip()
 
-    # Step 1: extract
     blob_path = tmp_path / "blob.hkx"
     runner = CliRunner()
     r1 = runner.invoke(cli, ["cloth", "extract", str(nif), "-o", str(blob_path)])
     assert r1.exit_code == 0, f"extract failed:\n{r1.output}"
 
-    # Step 2: pack unchanged blob back in
     out_nif = tmp_path / "repacked.nif"
     r2 = runner.invoke(
         cli,
@@ -67,7 +65,6 @@ def test_cloth_pack_round_trips(tmp_path: Path):
     assert r2.exit_code == 0, f"pack failed:\n{r2.output}"
     assert out_nif.is_file()
 
-    # Step 3: byte-identity check
     original = nif.read_bytes()
     repacked = out_nif.read_bytes()
     assert original == repacked, (

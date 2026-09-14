@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from pathlib import Path
 
 import click
 
@@ -25,6 +26,43 @@ def _error(msg: str) -> dict:
     return {"error": msg}
 
 
+def _dds_header_dump(path: Path) -> dict:
+    data = path.read_bytes()[:148]
+    if len(data) < 128 or data[:4] != b"DDS ":
+        raise ValueError("Not a valid DDS file")
+
+    def u32(offset):
+        return int.from_bytes(data[offset : offset + 4], "little")
+
+    four_cc = data[84:88].rstrip(b"\0").decode("ascii", errors="replace")
+    dump = {
+        "flags": u32(8),
+        "height": u32(12),
+        "width": u32(16),
+        "pitch_or_linear_size": u32(20),
+        "depth": u32(24),
+        "mip_map_count": u32(28),
+        "pixel_format_flags": u32(80),
+        "four_cc": four_cc,
+        "rgb_bit_count": u32(88),
+        "red_mask": u32(92),
+        "green_mask": u32(96),
+        "blue_mask": u32(100),
+        "alpha_mask": u32(104),
+        "caps": u32(108),
+        "caps2": u32(112),
+    }
+    if four_cc in {"DX10", "XBOX"} and len(data) >= 148:
+        dump["dx10"] = {
+            "dxgi_format": u32(128),
+            "resource_dimension": u32(132),
+            "misc_flag": u32(136),
+            "array_size": u32(140),
+            "misc_flags2": u32(144),
+        }
+    return dump
+
+
 def _load_nif_or_error(session_id: str):
     """Load NIF from session, return (nif, original_path) or print error and exit."""
     try:
@@ -35,7 +73,7 @@ def _load_nif_or_error(session_id: str):
 
 
 @click.group()
-@click.option("--format", "fmt", type=click.Choice(["json", "pretty", "compact", "table"]), default=None, help="Output format (overrides global --format).")
+@click.option("--format", "fmt", type=click.Choice(["json", "pretty", "compact", "table", "jsonl"]), default=None, help="Output format (overrides global --format).")
 @click.pass_context
 def nif(ctx, fmt):
     """Inspect and edit NIF mesh files."""
@@ -43,6 +81,1331 @@ def nif(ctx, fmt):
     cleanup_stale()
     if fmt is not None:
         ctx.obj["fmt"] = fmt
+
+
+@nif.command("validate")
+@click.argument("path")
+@click.option(
+    "--fix",
+    is_flag=True,
+    help="Apply safe game-aware fixes. Files are modified in place unless --output is used.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    default="",
+    help="Output file or directory for fixed NIFs.",
+)
+@click.option(
+    "--recursive/--no-recursive",
+    default=True,
+    show_default=True,
+    help="Recurse when PATH is a directory.",
+)
+@click.option("--jobs", default=0, type=int, show_default=True, help="Parallel NIF jobs. 0 = auto.")
+@click.option("--report", "report_path", default="", help="Write complete per-file JSON results.")
+@click.option(
+    "--include-optional",
+    is_flag=True,
+    help="Enable NIF checks that are off by default because they may report intentional content.",
+)
+@click.option(
+    "--check",
+    "checks",
+    multiple=True,
+    help="Run only the named NIF check ID. Repeat to select several checks.",
+)
+@click.option(
+    "--shape",
+    "shape_id",
+    default=None,
+    type=int,
+    help="Validate weights on one shape in an open session.",
+)
+@click.pass_context
+def validate_cmd(
+    ctx,
+    path,
+    fix,
+    output_path,
+    recursive,
+    jobs,
+    report_path,
+    include_optional,
+    checks,
+    shape_id,
+):
+    """Audit NIF, KF, and DDS files and optionally apply safe fixes.
+
+    PATH may be one supported file or a directory. Validation never modifies
+    files unless --fix is supplied. NIF/KF headers select the Morrowind,
+    Oblivion, FO3/FNV, Skyrim, Skyrim SE, FO4, FO76, or Starfield rule set.
+    DDS files are audited but not rewritten.
+    """
+    from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from pathlib import Path
+
+    from creation_lib.nif import native_runtime
+
+    fmt = ctx.obj["fmt"]
+    selected_checks = set(checks)
+    if selected_checks:
+        catalog = native_runtime.nif_features_raw()["checks"]
+        known_checks = {check["id"]: check for check in catalog}
+        unknown_checks = sorted(selected_checks - known_checks.keys())
+        if unknown_checks:
+            output(
+                _error(f"Unknown NIF check ID(s): {', '.join(unknown_checks)}"), fmt
+            )
+            return
+        include_optional = include_optional or any(
+            known_checks[check]["optional"] for check in selected_checks
+        )
+    source = Path(path).resolve()
+    if not source.exists():
+        if fix or output_path or report_path:
+            output(_error(f"Path not found: {source}"), fmt)
+            return
+        try:
+            nif_file, _ = load_session(path)
+        except FileNotFoundError:
+            output(_error(f"Path or session not found: {path}"), fmt)
+            return
+        from cli._nif_skinning import validate_weights
+        from creation_lib.nif.validation import validate_nif
+
+        result = (
+            validate_nif(nif_file)
+            if shape_id is None
+            else validate_weights(nif_file, shape_id=shape_id)
+        )
+        output(result, fmt)
+        return
+    if output_path and not fix:
+        output(_error("--output requires --fix"), fmt)
+        return
+
+    supported_extensions = {".nif", ".kf", ".dds"}
+    if source.is_file():
+        if source.suffix.lower() not in supported_extensions:
+            output(_error(f"Not a NIF, KF, or DDS file: {source}"), fmt)
+            return
+        files = [source]
+        source_root = source.parent
+    else:
+        candidates = source.rglob("*") if recursive else source.glob("*")
+        files = sorted(
+            file
+            for file in candidates
+            if file.is_file() and file.suffix.lower() in supported_extensions
+        )
+        source_root = source
+    if not files:
+        output(_error(f"No NIF, KF, or DDS files found: {source}"), fmt)
+        return
+
+    destination = Path(output_path).resolve() if output_path else None
+
+    def validate_one(file_path):
+        target = None
+        if fix:
+            if destination is None:
+                target = file_path
+            elif source.is_file():
+                target = destination / file_path.name if destination.is_dir() else destination
+            else:
+                target = destination / file_path.relative_to(source_root)
+        try:
+            if file_path.suffix.lower() == ".dds":
+                from creation_lib.dds import native_runtime as dds_native_runtime
+
+                report = dds_native_runtime.validate_dds_file_raw(
+                    str(file_path), include_optional=include_optional
+                )
+                if target is not None and target != file_path:
+                    import shutil
+
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file_path, target)
+            elif include_optional:
+                report = native_runtime.validate_nif_file_raw(
+                    str(file_path),
+                    str(target) if target is not None else None,
+                    fix,
+                    True,
+                )
+            else:
+                report = native_runtime.validate_nif_file_raw(
+                    str(file_path),
+                    str(target) if target is not None else None,
+                    fix,
+                )
+            if selected_checks:
+                report["findings"] = [
+                    finding
+                    for finding in report["findings"]
+                    if finding.get("check", finding["rule"]) in selected_checks
+                ]
+            return {
+                "path": str(file_path),
+                "output": str(target) if target is not None else "",
+                "success": True,
+                **report,
+            }
+        except Exception as exc:
+            return {
+                "path": str(file_path),
+                "output": str(target) if target is not None else "",
+                "success": False,
+                "error": str(exc),
+                "changed": False,
+                "changes": [],
+                "warnings": [],
+                "findings": [],
+            }
+
+    job_count = jobs if jobs > 0 else min(8, max(1, (os.cpu_count() or 1) - 1))
+    results = []
+    with ThreadPoolExecutor(max_workers=job_count) as executor:
+        futures = [executor.submit(validate_one, file_path) for file_path in files]
+        for completed, future in enumerate(as_completed(futures), 1):
+            results.append(future.result())
+            if len(files) > 25 and (completed == len(files) or completed % 100 == 0):
+                click.echo(f"nif validate: completed {completed}/{len(files)}", err=True)
+    results.sort(key=lambda item: item["path"].lower())
+
+    severities = Counter()
+    rules = Counter()
+    sample_findings = []
+    for result in results:
+        for finding in result["findings"]:
+            severities[finding["severity"]] += 1
+            rules[finding["rule"]] += 1
+            if len(sample_findings) < 100:
+                sample_findings.append({"path": result["path"], **finding})
+
+    summary = {
+        "path": str(source),
+        "files": len(results),
+        "valid": sum(
+            1
+            for result in results
+            if result["success"]
+            and not any(finding["severity"] == "error" for finding in result["findings"])
+        ),
+        "files_with_findings": sum(1 for result in results if result["findings"]),
+        "fixed_files": sum(1 for result in results if result["changed"]),
+        "changes": sum(len(result["changes"]) for result in results),
+        "games": dict(
+            sorted(
+                Counter(
+                    result.get("game", "unknown")
+                    for result in results
+                    if result["success"]
+                ).items()
+            )
+        ),
+        "findings": dict(sorted(severities.items())),
+        "rules": dict(sorted(rules.items())),
+        "failures": [
+            {"path": result["path"], "error": result.get("error", "")}
+            for result in results
+            if not result["success"]
+        ],
+        "sample_findings": sample_findings,
+        "report": str(Path(report_path).resolve()) if report_path else "",
+        "jobs": job_count,
+        "include_optional": include_optional,
+        "checks": sorted(selected_checks),
+    }
+    if report_path:
+        report_file = Path(report_path).resolve()
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        report_file.write_text(
+            json.dumps({"summary": summary, "results": results}, indent=2),
+            encoding="utf-8",
+        )
+    elif len(results) == 1:
+        summary["result"] = results[0]
+    output(summary, fmt)
+
+
+@nif.command("features")
+@click.option(
+    "--category",
+    type=click.Choice(["NIF", "Report", "Animation", "Collision", "Shader"], case_sensitive=False),
+    default=None,
+    help="Only show one NIF processor category.",
+)
+@click.option(
+    "--parity",
+    type=click.Choice(["complete", "partial", "missing"]),
+    default=None,
+    help="Only show processors with this parity state.",
+)
+@click.pass_context
+def nif_features_cmd(ctx, category, parity):
+    """List the registered NIF processor and validation-check contract."""
+    from creation_lib.nif import native_runtime
+
+    result = native_runtime.nif_features_raw()
+    processors = result["processors"]
+    if category:
+        processors = [
+            processor
+            for processor in processors
+            if processor["category"].lower() == category.lower()
+        ]
+    if parity:
+        processors = [
+            processor for processor in processors if processor["parity"] == parity
+        ]
+    result["processors"] = processors
+    result["summary"] = {
+        "processors": len(processors),
+        "checks": len(result["checks"]),
+        "parity": dict(
+            sorted(
+                {
+                    state: sum(
+                        processor["parity"] == state for processor in processors
+                    )
+                    for state in ("complete", "partial", "missing")
+                }.items()
+            )
+        ),
+        "commands": dict(
+            sorted(
+                {
+                    command: sum(
+                        processor.get("command") == command for processor in processors
+                    )
+                    for command in ("validate", "report", "process")
+                }.items()
+            )
+        ),
+    }
+    output(result, ctx.obj["fmt"])
+
+
+@nif.command("report")
+@click.argument(
+    "processor",
+    type=click.Choice(
+        [
+            "analyze-mesh",
+            "transform-information",
+            "havok-information",
+            "find-unwelded-vertices",
+            "find-excessive-draw-calls",
+            "find-uvs",
+            "find-textures",
+        ]
+    ),
+)
+@click.argument("path")
+@click.option("--recursive/--no-recursive", default=True, show_default=True)
+@click.option("--cache-size", default=16, show_default=True, type=int)
+@click.option("--per-shape", is_flag=True)
+@click.option("--threshold/--no-threshold", default=True, show_default=True)
+@click.option("--acmr", default=1.5, show_default=True, type=float)
+@click.option("--atvr", default=1.5, show_default=True, type=float)
+@click.option("--vertices", default=0, show_default=True, type=int)
+@click.option("--translation/--no-translation", default=True, show_default=True)
+@click.option("--rotation/--no-rotation", default=True, show_default=True)
+@click.option("--scale/--no-scale", default=True, show_default=True)
+@click.option("--skip-empty/--include-empty", default=True, show_default=True)
+@click.option("--per-object/--summary-only", default=True, show_default=True)
+@click.option("--field", "fields", multiple=True, help="Havok rigid-body field to include.")
+@click.option("--distance", default=0.1, show_default=True, type=float)
+@click.option("--skip-same", is_flag=True)
+@click.option("--report-vertices", is_flag=True)
+@click.option("--draw-call-threshold", default=10, show_default=True, type=int)
+@click.option("--u-min", default=0.0, type=float, show_default=True)
+@click.option("--u-max", default=None, type=float)
+@click.option("--v-min", default=0.0, type=float, show_default=True)
+@click.option("--v-max", default=None, type=float)
+@click.option("--texture-format", "texture_formats", multiple=True)
+@click.option(
+    "--header-dump/--no-header-dump",
+    default=False,
+    show_default=True,
+    help="Include the parsed DDS header in find-textures results.",
+)
+@click.option(
+    "--resolution",
+    type=click.Choice(
+        [
+            "not-power-of-two",
+            "lt-128",
+            "lt-256",
+            "lt-512",
+            "lt-1024",
+            "lt-2048",
+            "lt-4096",
+            "gte-128",
+            "gte-256",
+            "gte-512",
+            "gte-1024",
+            "gte-2048",
+            "gte-4096",
+        ]
+    ),
+    default=None,
+)
+@click.option("--bits-per-pixel", default=None, type=int)
+@click.option("--mipmaps", type=click.Choice(["yes", "no"]), default=None)
+@click.option("--has-alpha", type=click.Choice(["yes", "no"]), default=None)
+@click.option("--cubemap", type=click.Choice(["yes", "no"]), default=None)
+@click.option("--compressed", type=click.Choice(["yes", "no"]), default=None)
+@click.option("--dx10-supported", type=click.Choice(["yes", "no"]), default=None)
+@click.option("--xbox", type=click.Choice(["yes", "no"]), default=None)
+@click.option("--copy-to", default="", help="Copy matching textures under this directory.")
+@click.pass_context
+def nif_report_cmd(
+    ctx,
+    processor,
+    path,
+    recursive,
+    cache_size,
+    per_shape,
+    threshold,
+    acmr,
+    atvr,
+    vertices,
+    translation,
+    rotation,
+    scale,
+    skip_empty,
+    per_object,
+    fields,
+    distance,
+    skip_same,
+    report_vertices,
+    draw_call_threshold,
+    u_min,
+    u_max,
+    v_min,
+    v_max,
+    texture_formats,
+    header_dump,
+    resolution,
+    bits_per_pixel,
+    mipmaps,
+    has_alpha,
+    cubemap,
+    compressed,
+    dx10_supported,
+    xbox,
+    copy_to,
+):
+    """Run one of NIF's read-only report processors."""
+    from pathlib import Path
+
+    source = Path(path).resolve()
+    if not source.exists():
+        output(_error(f"Path not found: {source}"), ctx.obj["fmt"])
+        return
+    extension = ".dds" if processor == "find-textures" else ".nif"
+    if source.is_file():
+        files = [source] if source.suffix.lower() == extension else []
+    else:
+        candidates = source.rglob("*") if recursive else source.glob("*")
+        files = sorted(
+            file
+            for file in candidates
+            if file.is_file() and file.suffix.lower() == extension
+        )
+    if not files:
+        output(_error(f"No {extension} files found: {source}"), ctx.obj["fmt"])
+        return
+    if copy_to and processor != "find-textures":
+        output(_error("--copy-to is only valid for find-textures"), ctx.obj["fmt"])
+        return
+
+    options = {
+        "cache_size": cache_size,
+        "per_shape": per_shape,
+        "threshold": threshold,
+        "acmr": acmr,
+        "atvr": atvr,
+        "vertices": vertices,
+        "translation": translation,
+        "rotation": rotation,
+        "scale": scale,
+        "skip_empty": skip_empty,
+        "per_object": per_object,
+        "fields": list(fields),
+        "distance": distance,
+        "skip_same": skip_same,
+        "report_vertices": report_vertices,
+        "draw_call_threshold": draw_call_threshold,
+        "u_min": u_min,
+        "u_max": u_max,
+        "v_min": v_min,
+        "v_max": v_max,
+    }
+    results = []
+    examined = 0
+    copy_root = Path(copy_to).resolve() if copy_to else None
+    for file in files:
+        examined += 1
+        try:
+            if processor == "find-textures":
+                from creation_lib.dds import native_runtime as dds_native_runtime
+
+                data = dds_native_runtime.texdiag_info(str(file))
+                if data is None:
+                    raise RuntimeError("directxtex_native.texdiag_info is not available")
+                if header_dump:
+                    data["header"] = _dds_header_dump(file)
+                if texture_formats and not any(
+                    selected.upper() in {
+                        str(data["format"]).upper(),
+                        str(data["dxgi_format"]),
+                    }
+                    for selected in texture_formats
+                ):
+                    continue
+                max_resolution = max(data["width"], data["height"])
+                if resolution == "not-power-of-two" and data["is_power_of_two"]:
+                    continue
+                if resolution and resolution.startswith("lt-"):
+                    if max_resolution >= int(resolution[3:]):
+                        continue
+                if resolution and resolution.startswith("gte-"):
+                    if max_resolution < int(resolution[4:]):
+                        continue
+                texture_bools = [
+                    (mipmaps, data["mip_levels"] > 1),
+                    (has_alpha, data["has_alpha"]),
+                    (cubemap, data["is_cubemap"]),
+                    (compressed, data["is_compressed"]),
+                    (dx10_supported, data["dxgi_format"] != 0),
+                    (xbox, data["is_xbox"]),
+                ]
+                if any(
+                    selected is not None
+                    and ((selected == "yes") != actual)
+                    for selected, actual in texture_bools
+                ):
+                    continue
+                if bits_per_pixel is not None and data["bits_per_pixel"] != bits_per_pixel:
+                    continue
+                copied_to = ""
+                if copy_root is not None:
+                    import shutil
+
+                    relative = file.name if source.is_file() else file.relative_to(source)
+                    target = copy_root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file, target)
+                    copied_to = str(target)
+                result = {
+                    "processor": processor,
+                    "path": str(file),
+                    "game": "dds",
+                    "data": data,
+                    "copied_to": copied_to,
+                }
+            else:
+                from creation_lib.nif import native_runtime
+
+                native_options = dict(options)
+                native_options["threshold"] = (
+                    draw_call_threshold
+                    if processor == "find-excessive-draw-calls"
+                    else threshold
+                )
+                result = native_runtime.nif_report_raw(
+                    str(file), processor, native_options
+                )
+            results.append({"success": True, **result})
+        except Exception as exc:
+            results.append(
+                {
+                    "success": False,
+                    "processor": processor,
+                    "path": str(file),
+                    "error": str(exc),
+                }
+            )
+    output(
+        {
+            "processor": processor,
+            "path": str(source),
+            "files": examined,
+            "matched": len(results),
+            "failures": sum(not result["success"] for result in results),
+            "results": results,
+        },
+        ctx.obj["fmt"],
+    )
+
+
+@nif.command("process")
+@click.argument(
+    "processor",
+    type=click.Choice(
+        [
+            "update-tangents",
+            "optimize-mesh",
+            "json-converter",
+            "universal-tweaker",
+            "universal-fixer",
+            "update-bounds",
+            "replace-assets",
+            "remove-unused-nodes",
+            "convert-block-type",
+            "set-missing-names",
+            "unskin-mesh",
+            "update-shader-flags",
+            "walls-reflection-flag",
+            "soft-particles",
+            "update-ragdoll-constraint",
+            "update-havok-settings",
+            "update-havok-inertia",
+            "search-havok-material",
+            "copy-controlled-blocks",
+            "copy-priorities",
+            "remove-controlled-blocks",
+            "quadratic-to-linear",
+            "fix-exported-kf",
+            "optimize-animations",
+            "add-transform-data",
+            "add-headtracking-anim",
+            "add-facial-anim",
+            "weijiesen-blow-up",
+            "add-skeleton-blocks",
+            "update-mopp-code",
+            "remove-nodes",
+            "attach-parent",
+            "adjust-transform",
+            "copy-geometry-blocks",
+            "merge-properties",
+            "group-shapes",
+            "vertex-paint",
+            "merge-shapes",
+            "apply-transform",
+            "add-root-collision-node",
+            "add-bounding-box",
+            "add-lod-node",
+        ]
+    ),
+)
+@click.argument("path")
+@click.option("--output", "output_path", default="", help="Output file or directory.")
+@click.option("--in-place", is_flag=True, help="Modify input files in place.")
+@click.option("--recursive/--no-recursive", default=True, show_default=True)
+@click.option("--search", default=None, help="Text to find for replace-assets.")
+@click.option("--replace", default=None, help="Replacement text for replace-assets.")
+@click.option(
+    "--replacement",
+    "replacement_pairs",
+    type=(str, str),
+    multiple=True,
+    metavar="SEARCH REPLACE",
+    help="NIF replacement pair; repeat for multiple pairs.",
+)
+@click.option("--case-sensitive", is_flag=True)
+@click.option("--regex", "use_regex", is_flag=True, help="Treat search strings as regex.")
+@click.option("--fix-absolute", is_flag=True, help="Truncate absolute paths through Data\\.")
+@click.option("--report-only", is_flag=True, help="Report replacements without saving.")
+@click.option(
+    "--json-direction",
+    type=click.Choice(["to-json", "from-json"]),
+    default=None,
+    help="JSON Converter direction; inferred from each file extension when omitted.",
+)
+@click.option(
+    "--default-extension",
+    default="nif",
+    show_default=True,
+    help="Extension for from-json inputs whose pre-.json name has no extension.",
+)
+@click.option("--decimal-digits", type=click.IntRange(6, 16), default=8, show_default=True)
+@click.option(
+    "--rotation-output",
+    type=click.Choice(["angle-axis", "euler", "matrix"]),
+    default="angle-axis",
+    show_default=True,
+    help="Rotation text representation; matrix is a compatibility alias for angle-axis.",
+)
+@click.option(
+    "--block",
+    "tweak_blocks",
+    multiple=True,
+    help="Universal Tweaker block type or linked block path; repeat for several types.",
+)
+@click.option("--inherited", is_flag=True, help="Include descendants of --block types.")
+@click.option("--field-path", default=None, help="Universal Tweaker field path.")
+@click.option("--value", "tweak_value", default="", help="Universal Tweaker value.")
+@click.option(
+    "--value-mode",
+    type=click.Choice(
+        [
+            "set",
+            "add",
+            "multiply",
+            "replace",
+            "prepend",
+            "append",
+            "and",
+            "and-not",
+            "or",
+            "remove",
+            "round",
+            "multiply-round",
+        ]
+    ),
+    default="set",
+    show_default=True,
+)
+@click.option("--old-value-check", is_flag=True)
+@click.option("--old-path", default="", help="Field checked before tweaking; defaults to --field-path.")
+@click.option(
+    "--old-mode",
+    type=click.Choice(
+        [
+            "equal",
+            "not-equal",
+            "greater",
+            "lesser",
+            "contains",
+            "doesnt-contain",
+            "starts-with",
+            "ends-with",
+            "and",
+            "and-not",
+            "regex",
+        ]
+    ),
+    default="equal",
+    show_default=True,
+)
+@click.option("--old-value", default="")
+@click.option("--add-if-missing", is_flag=True, help="Add tangent data when absent.")
+@click.option("--face-normals", is_flag=True, help="Recalculate normals before tangents.")
+@click.option("--triangulate", is_flag=True)
+@click.option("--stripify", is_flag=True)
+@click.option("--vertex-cache/--no-vertex-cache", default=True, show_default=True)
+@click.option("--overdraw/--no-overdraw", default=True, show_default=True)
+@click.option("--vertex-fetch/--no-vertex-fetch", default=True, show_default=True)
+@click.option("--flags1", default=None, help="Shader Flags 1 mask (decimal or 0xhex).")
+@click.option("--flags2", default=None, help="Shader Flags 2 mask (decimal or 0xhex).")
+@click.option(
+    "--flag-mode",
+    type=click.Choice(["add", "set", "remove"]),
+    default="add",
+    show_default=True,
+)
+@click.option("--map-scale", default=0.8, type=float, show_default=True)
+@click.option("--normal-intensity", default=None, type=float)
+@click.option("--blend-intensity", default=None, type=float)
+@click.option("--soft-scale", default=0.05, type=float, show_default=True)
+@click.option("--convert-to-malleable", is_flag=True)
+@click.option(
+    "--setting",
+    "havok_settings",
+    multiple=True,
+    metavar="NAME=VALUE",
+    help="Havok setting; repeat for multiple fields. Enum names and numeric values are accepted.",
+)
+@click.option("--update-inertia/--no-update-inertia", default=True, show_default=True)
+@click.option("--update-center/--no-update-center", default=True, show_default=True)
+@click.option("--update-penetration", is_flag=True)
+@click.option("--penetration-statics", is_flag=True)
+@click.option("--depth-multiplier", type=float, default=0.2, show_default=True)
+@click.option(
+    "--body-part-mult",
+    "body_part_multipliers",
+    multiple=True,
+    metavar="PART=MULTIPLIER",
+)
+@click.option(
+    "--material-search",
+    default=None,
+    help="Havok material name or numeric value to find.",
+)
+@click.option(
+    "--material-replace",
+    default=None,
+    help="Replacement Havok material name or numeric value.",
+)
+@click.option("--skip-root-collision", is_flag=True)
+@click.option(
+    "--source-dir",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="NIF source directory containing matching relative-path files.",
+)
+@click.option(
+    "--source-file",
+    "copy_source_file",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Single source NIF used by copy-geometry-blocks.",
+)
+@click.option("--copy-geometry/--no-copy-geometry", default=True, show_default=True)
+@click.option("--copy-transform", is_flag=True)
+@click.option("--copy-shader", is_flag=True)
+@click.option("--copy-texture-set", is_flag=True)
+@click.option("--name", "controlled_names", multiple=True)
+@click.option("--exact-match/--partial-match", default=None)
+@click.option("--not-matching", is_flag=True)
+@click.option(
+    "--rotation-keys/--no-rotation-keys",
+    "add_rotation",
+    default=True,
+    show_default=True,
+)
+@click.option(
+    "--translation-keys/--no-translation-keys",
+    "add_translation",
+    default=True,
+    show_default=True,
+)
+@click.option("--cycle-clamp-only", is_flag=True)
+@click.option("--head-key-value-14", "key_value_14", type=float, default=0.0, show_default=True)
+@click.option("--head-key-value-23", "key_value_23", type=float, default=100.0, show_default=True)
+@click.option("--head-key-time-2", "key_time_2", type=float, default=20.0, show_default=True)
+@click.option("--head-key-time-3", "key_time_3", type=float, default=80.0, show_default=True)
+@click.option("--remove-existing-facial", is_flag=True)
+@click.option(
+    "--facial-mod",
+    "facial_mods",
+    multiple=True,
+    metavar='"PRIORITY MODIFIER TIME VALUE [...]"',
+    help="Facial animation row; repeat for each modifier.",
+)
+@click.option(
+    "--no-facial-mods",
+    is_flag=True,
+    help="Do not use NIF's default facial animation rows.",
+)
+@click.option("--node-type", default=None, help="Remove blocks of this exact NIF type.")
+@click.option(
+    "--find-name",
+    default="##SightingNode",
+    show_default=True,
+    help="Existing node name for attach-parent.",
+)
+@click.option(
+    "--parent-name",
+    default="##ISControl",
+    show_default=True,
+    help="New parent node name for attach-parent.",
+)
+@click.option(
+    "--transform-mode",
+    type=click.Choice(["add", "multiply", "set"]),
+    default="add",
+    show_default=True,
+)
+@click.option("--translate-x", type=float, default=None)
+@click.option("--translate-y", type=float, default=None)
+@click.option("--translate-z", type=float, default=None)
+@click.option("--yaw", type=float, default=None, help="Yaw adjustment in degrees.")
+@click.option("--pitch", type=float, default=None, help="Pitch adjustment in degrees.")
+@click.option("--roll", type=float, default=None, help="Roll adjustment in degrees.")
+@click.option("--scale", type=float, default=None)
+@click.option(
+    "--property-type",
+    "property_types",
+    multiple=True,
+    help="Property block type to deduplicate; repeat for several types.",
+)
+@click.option(
+    "--ignore-name/--compare-name",
+    default=True,
+    show_default=True,
+    help="Ignore Name when comparing properties.",
+)
+@click.option("--split", is_flag=True, help="Split groups at the 16-bit vertex/triangle limit.")
+@click.option(
+    "--all-features",
+    is_flag=True,
+    help="Use every texture slot when grouping shapes.",
+)
+@click.option(
+    "--paint-mode",
+    type=click.Choice(["set", "adjust", "remove", "replace"]),
+    default="set",
+    show_default=True,
+)
+@click.option("--shape-name", default="", help="Only paint shapes containing this name.")
+@click.option("--color", default="FFFFFFFF", show_default=True, help="RRGGBBAA color.")
+@click.option("--replacement-color", default="FFFFFFFF", show_default=True)
+@click.option("--skip-color", default=None, help="RRGGBBAA color to leave unchanged.")
+@click.option("--all-white", is_flag=True, help="Only remove colors when all match --color.")
+@click.option(
+    "--adjust-mode",
+    type=click.Choice(["multiply", "add"]),
+    default="multiply",
+    show_default=True,
+)
+@click.option("--adjust-h", type=float, default=None)
+@click.option("--adjust-s", type=float, default=None)
+@click.option("--adjust-l", type=float, default=None)
+@click.option("--adjust-a", type=float, default=None)
+@click.option("--apply-skinned", is_flag=True, help="Also bake skinned nodes and bones.")
+@click.option("--apply-animated", is_flag=True, help="Also bake animated nodes.")
+@click.option("--apply-collision", is_flag=True, help="Also bake nodes with collision.")
+@click.option("--apply-root", is_flag=True, help="Also bake a skinned mesh root.")
+@click.option(
+    "--apply-controller-manager",
+    is_flag=True,
+    help="Also bake meshes containing NiControllerManager.",
+)
+@click.option("--bounding-flags", default=12, type=int, show_default=True)
+@click.option("--center", type=(float, float, float), default=None)
+@click.option("--extent", type=(float, float, float), default=None)
+@click.option(
+    "--lod-data",
+    type=click.Choice(["range", "screen"]),
+    default="range",
+    show_default=True,
+)
+@click.option("--lod-extent", "lod_extents", multiple=True, type=float)
+@click.option("--lod-proportion", "lod_proportions", multiple=True, type=float)
+@click.option("--single-root/--multiple-roots", default=True, show_default=True)
+@click.option("--from", "from_type", default=None, help="Source NIF block type.")
+@click.option("--to", "to_type", default=None, help="Destination NIF block type.")
+@click.option("--root-only", is_flag=True)
+@click.option("--rename-root/--keep-root-name", default=True, show_default=True)
+@click.pass_context
+def nif_process_cmd(
+    ctx,
+    processor,
+    path,
+    output_path,
+    in_place,
+    recursive,
+    search,
+    replace,
+    replacement_pairs,
+    case_sensitive,
+    use_regex,
+    fix_absolute,
+    report_only,
+    json_direction,
+    default_extension,
+    decimal_digits,
+    rotation_output,
+    tweak_blocks,
+    inherited,
+    field_path,
+    tweak_value,
+    value_mode,
+    old_value_check,
+    old_path,
+    old_mode,
+    old_value,
+    add_if_missing,
+    face_normals,
+    triangulate,
+    stripify,
+    vertex_cache,
+    overdraw,
+    vertex_fetch,
+    flags1,
+    flags2,
+    flag_mode,
+    map_scale,
+    normal_intensity,
+    blend_intensity,
+    soft_scale,
+    convert_to_malleable,
+    havok_settings,
+    update_inertia,
+    update_center,
+    update_penetration,
+    penetration_statics,
+    depth_multiplier,
+    body_part_multipliers,
+    material_search,
+    material_replace,
+    skip_root_collision,
+    source_dir,
+    copy_source_file,
+    copy_geometry,
+    copy_transform,
+    copy_shader,
+    copy_texture_set,
+    controlled_names,
+    exact_match,
+    not_matching,
+    add_rotation,
+    add_translation,
+    cycle_clamp_only,
+    key_value_14,
+    key_value_23,
+    key_time_2,
+    key_time_3,
+    remove_existing_facial,
+    facial_mods,
+    no_facial_mods,
+    node_type,
+    find_name,
+    parent_name,
+    transform_mode,
+    translate_x,
+    translate_y,
+    translate_z,
+    yaw,
+    pitch,
+    roll,
+    scale,
+    property_types,
+    ignore_name,
+    split,
+    all_features,
+    paint_mode,
+    shape_name,
+    color,
+    replacement_color,
+    skip_color,
+    all_white,
+    adjust_mode,
+    adjust_h,
+    adjust_s,
+    adjust_l,
+    adjust_a,
+    apply_skinned,
+    apply_animated,
+    apply_collision,
+    apply_root,
+    apply_controller_manager,
+    bounding_flags,
+    center,
+    extent,
+    lod_data,
+    lod_extents,
+    lod_proportions,
+    single_root,
+    from_type,
+    to_type,
+    root_only,
+    rename_root,
+):
+    """Run a NIF-compatible mutating processor on NIF files."""
+    from pathlib import Path
+
+    if processor == "search-havok-material" and material_replace is None:
+        report_only = True
+    default_names = {
+        "quadratic-to-linear": ("Head", "Neck"),
+        "remove-controlled-blocks": ("Head", "Neck"),
+        "add-skeleton-blocks": ("Weapon", "HeadAnims"),
+        "merge-shapes": (".dds",),
+    }
+    if not controlled_names:
+        controlled_names = default_names.get(processor, ())
+    if exact_match is None:
+        exact_match = processor != "merge-shapes"
+    if processor == "add-facial-anim" and not facial_mods and not no_facial_mods:
+        facial_mods = (
+            "99 Aah 0.466667 0 1.499999 1",
+            "99 Eh 1.500000 1",
+            "99 BigAah 1.5 1 1.833333 0.1 3.333333 0.5 4.033333 1",
+        )
+    if processor == "json-converter" and in_place:
+        output(_error("json-converter requires --output"), ctx.obj["fmt"])
+        return
+    if report_only and processor not in {
+        "replace-assets",
+        "universal-tweaker",
+        "update-shader-flags",
+        "search-havok-material",
+    }:
+        output(
+            _error(
+                "--report-only is not valid for this processor"
+            ),
+            ctx.obj["fmt"],
+        )
+        return
+    if not report_only and in_place == bool(output_path):
+        output(_error("Select exactly one of --output or --in-place"), ctx.obj["fmt"])
+        return
+    if report_only and (in_place or output_path):
+        output(_error("--report-only does not accept --output or --in-place"), ctx.obj["fmt"])
+        return
+    source = Path(path).resolve()
+    if not source.exists():
+        output(_error(f"Path not found: {source}"), ctx.obj["fmt"])
+        return
+    extensions = {
+        "replace-assets": {".nif", ".bgsm", ".bgem"},
+        "remove-unused-nodes": {".nif", ".kf", ".kfm"},
+        "remove-controlled-blocks": {".nif", ".kf"},
+        "quadratic-to-linear": {".kf"},
+        "fix-exported-kf": {".kf"},
+        "optimize-animations": {".nif", ".kf"},
+        "add-transform-data": {".kf"},
+        "add-headtracking-anim": {".kf"},
+        "add-facial-anim": {".kf"},
+        "copy-controlled-blocks": {".kf"},
+        "copy-priorities": {".kf"},
+        "add-skeleton-blocks": {".kf"},
+        "remove-nodes": {".nif", ".kf"},
+        "adjust-transform": {".nif", ".kf"},
+        "universal-tweaker": {".nif", ".kf", ".bgsm", ".bgem"},
+    }.get(processor, {".nif"})
+    if processor == "json-converter":
+        extensions = {
+            "to-json": {".nif", ".kf"},
+            "from-json": {".json"},
+            None: {".nif", ".kf", ".json"},
+        }[json_direction]
+    if source.is_file():
+        files = [source] if source.suffix.lower() in extensions else []
+        source_root = source.parent
+    else:
+        candidates = source.rglob("*") if recursive else source.glob("*")
+        files = sorted(
+            file
+            for file in candidates
+            if file.is_file() and file.suffix.lower() in extensions
+        )
+        source_root = source
+    if not files:
+        expected = ", ".join(sorted(extensions))
+        output(_error(f"No {expected} files found: {source}"), ctx.obj["fmt"])
+        return
+    if processor in {"copy-controlled-blocks", "copy-priorities"}:
+        if source_dir is None:
+            output(_error("--source-dir is required for this processor"), ctx.obj["fmt"])
+            return
+    if processor == "copy-geometry-blocks":
+        if (source_dir is None) == (copy_source_file is None):
+            output(
+                _error("Select exactly one of --source-dir or --source-file"),
+                ctx.obj["fmt"],
+            )
+            return
+        if source_dir is not None:
+            source_dir = source_dir.resolve()
+            if not source_dir.is_dir():
+                output(_error(f"Source directory not found: {source_dir}"), ctx.obj["fmt"])
+                return
+        else:
+            copy_source_file = copy_source_file.resolve()
+            if not copy_source_file.is_file():
+                output(_error(f"Source file not found: {copy_source_file}"), ctx.obj["fmt"])
+                return
+
+    destination = Path(output_path).resolve() if output_path else None
+    try:
+        flags1_value = int(flags1, 0) if flags1 is not None else None
+        flags2_value = int(flags2, 0) if flags2 is not None else None
+    except ValueError as exc:
+        output(_error(f"Invalid numeric option: {exc}"), ctx.obj["fmt"])
+        return
+
+    def numeric_or_symbolic(value):
+        if value is None:
+            return None
+        try:
+            return int(value, 0)
+        except ValueError:
+            return value.strip()
+
+    material_search_value = numeric_or_symbolic(material_search)
+    material_replace_value = numeric_or_symbolic(material_replace)
+    settings = {}
+    for setting in havok_settings:
+        if "=" not in setting:
+            output(_error(f"Invalid --setting {setting!r}; expected NAME=VALUE"), ctx.obj["fmt"])
+            return
+        name, value = setting.split("=", 1)
+        name = name.strip().lower().replace("-", "_").replace(" ", "_")
+        try:
+            settings[name] = float(value) if any(c in value.lower() for c in ".e") else int(value, 0)
+        except ValueError:
+            settings[name] = value.strip()
+    inertia_multipliers = None
+    if body_part_multipliers:
+        inertia_multipliers = {}
+        for value in body_part_multipliers:
+            if "=" not in value:
+                output(_error(f"Invalid --body-part-mult {value!r}; expected PART=MULTIPLIER"), ctx.obj["fmt"])
+                return
+            part, multiplier = value.split("=", 1)
+            try:
+                inertia_multipliers[str(int(part, 0))] = float(multiplier)
+            except ValueError:
+                output(_error(f"Invalid --body-part-mult {value!r}"), ctx.obj["fmt"])
+                return
+    options = {
+        "search": search,
+        "replace": replace,
+        "pairs": [list(pair) for pair in replacement_pairs],
+        "case_sensitive": case_sensitive,
+        "regex": use_regex,
+        "fix_absolute": fix_absolute,
+        "report_only": report_only,
+        "json_direction": json_direction,
+        "default_extension": default_extension.lstrip("."),
+        "decimal_digits": decimal_digits,
+        "rotation_output": rotation_output,
+        "blocks": list(tweak_blocks),
+        "inherited": inherited,
+        "field_path": field_path,
+        "value": tweak_value,
+        "value_mode": value_mode,
+        "old_value_check": old_value_check,
+        "old_path": old_path,
+        "old_mode": old_mode,
+        "old_value": old_value,
+        "add_if_missing": add_if_missing,
+        "face_normals": face_normals,
+        "triangulate": triangulate,
+        "stripify": stripify,
+        "vertex_cache": vertex_cache,
+        "overdraw": overdraw,
+        "vertex_fetch": vertex_fetch,
+        "flags1": flags1_value,
+        "flags2": flags2_value,
+        "mode": flag_mode,
+        "map_scale": map_scale,
+        "normal_intensity": normal_intensity,
+        "blend_intensity": blend_intensity,
+        "soft_scale": soft_scale,
+        "convert_to_malleable": convert_to_malleable,
+        "settings": settings,
+        "update_inertia": update_inertia,
+        "update_center": update_center,
+        "update_penetration": update_penetration,
+        "penetration_statics": penetration_statics,
+        "depth_multiplier": depth_multiplier,
+        "body_part_multipliers": inertia_multipliers,
+        "material_search": material_search_value,
+        "material_replace": material_replace_value,
+        "skip_root": skip_root_collision,
+        "copy_geometry": copy_geometry,
+        "copy_transform": copy_transform,
+        "copy_shader": copy_shader,
+        "copy_texture_set": copy_texture_set,
+        "names": list(controlled_names),
+        "exact_match": exact_match,
+        "not_matching": not_matching,
+        "add_rotation": add_rotation,
+        "add_translation": add_translation,
+        "cycle_clamp_only": cycle_clamp_only,
+        "key_value_14": key_value_14,
+        "key_value_23": key_value_23,
+        "key_time_2": key_time_2,
+        "key_time_3": key_time_3,
+        "remove_existing_facial": remove_existing_facial,
+        "facial_mods": list(facial_mods) if facial_mods or no_facial_mods else None,
+        "node_type": node_type,
+        "find_name": find_name,
+        "parent_name": parent_name,
+        "transform_mode": transform_mode,
+        "translate_x": translate_x,
+        "translate_y": translate_y,
+        "translate_z": translate_z,
+        "yaw": yaw,
+        "pitch": pitch,
+        "roll": roll,
+        "scale": scale,
+        "property_types": list(property_types) if property_types else None,
+        "ignore_name": ignore_name,
+        "split": split,
+        "all_features": all_features,
+        "paint_mode": paint_mode,
+        "shape_name": shape_name,
+        "color": color,
+        "replacement_color": replacement_color,
+        "skip_color": skip_color,
+        "skip_color_enabled": skip_color is not None,
+        "all_white": all_white,
+        "adjust_mode": adjust_mode,
+        "adjust_h": adjust_h,
+        "adjust_s": adjust_s,
+        "adjust_l": adjust_l,
+        "adjust_a": adjust_a,
+        "apply_skinned": apply_skinned,
+        "apply_animated": apply_animated,
+        "apply_collision": apply_collision,
+        "apply_root": apply_root,
+        "apply_controller_manager": apply_controller_manager,
+        "bounding_flags": bounding_flags,
+        "center": list(center) if center else None,
+        "extent": list(extent) if extent else None,
+        "lod_data": lod_data,
+        "extents": list(lod_extents) if lod_extents else None,
+        "proportions": list(lod_proportions) if lod_proportions else None,
+        "single_root": single_root,
+        "from": from_type,
+        "to": to_type,
+        "root_only": root_only,
+        "rename_root": rename_root,
+    }
+    results = []
+    from creation_lib.nif import native_runtime
+
+    for file in files:
+        if report_only or in_place:
+            target = file
+        elif source.is_file():
+            target = destination / file.name if destination.is_dir() else destination
+        else:
+            target = destination / file.relative_to(source_root)
+        if processor == "json-converter":
+            direction = json_direction or (
+                "from-json" if file.suffix.lower() == ".json" else "to-json"
+            )
+            if direction == "to-json":
+                target_name = file.name + ".json"
+            else:
+                target_name = file.stem
+                if not Path(target_name).suffix:
+                    target_name += "." + default_extension.lstrip(".")
+            if source.is_dir():
+                target = destination / file.relative_to(source_root).parent / target_name
+            elif destination.is_dir():
+                target = destination / target_name
+        file_options = dict(options)
+        if processor in {"copy-controlled-blocks", "copy-priorities"}:
+            relative = file.name if source.is_file() else file.relative_to(source_root)
+            file_options["source_file"] = str(source_dir / relative)
+        elif processor == "copy-geometry-blocks":
+            if copy_source_file is not None:
+                file_options["source_file"] = str(copy_source_file)
+            else:
+                relative = file.name if source.is_file() else file.relative_to(source_root)
+                file_options["source_file"] = str(source_dir / relative)
+        try:
+            result = native_runtime.nif_process_raw(
+                str(file), str(target), processor, file_options
+            )
+            results.append({"success": True, **result})
+        except Exception as exc:
+            results.append(
+                {
+                    "success": False,
+                    "processor": processor,
+                    "path": str(file),
+                    "output": str(target),
+                    "error": str(exc),
+                    "changed": False,
+                    "changes": [],
+                }
+            )
+    output(
+        {
+            "processor": processor,
+            "path": str(source),
+            "files": len(results),
+            "changed": sum(result["changed"] for result in results),
+            "failures": sum(not result["success"] for result in results),
+            "results": results,
+        },
+        ctx.obj["fmt"],
+    )
 
 
 @nif.command("open")
@@ -944,34 +2307,6 @@ def partitions(ctx, session_id, shape_id, reference_path, method):
 
 @nif.command()
 @click.argument("session_id")
-@click.option("--shape", "shape_id", default=None, type=int, help="Validate weights on one BSTriShape block ID")
-@click.pass_context
-def validate(ctx, session_id, shape_id):
-    """Validate NIF structure, references, materials, and optional shape weights.
-
-    Examples:
-
-      modkit nif validate abc123
-
-      modkit nif validate abc123 --shape 3
-    """
-    from cli._nif_skinning import validate_weights
-    from creation_lib.nif.validation import validate_nif
-
-    fmt = ctx.obj["fmt"]
-    nif_file, original_path = _load_nif_or_error(session_id)
-    try:
-        if shape_id is None:
-            result = validate_nif(nif_file)
-        else:
-            result = validate_weights(nif_file, shape_id=shape_id)
-        output(result, fmt)
-    except Exception as e:
-        output(_error(str(e)), fmt)
-
-
-@nif.command()
-@click.argument("session_id")
 @click.option("--shape", "shape_id", default=0, type=int, help="BSTriShape block ID")
 @click.option("--max-bones", default=4, type=int, help="Max bone influences per vertex")
 @click.pass_context
@@ -997,9 +2332,15 @@ def normalize(ctx, session_id, shape_id, max_bones):
 
 
 @nif.command()
-@click.argument("commands_json")
+@click.argument("commands_json", required=False)
+@click.option(
+    "--file",
+    "commands_file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Read commands JSON from a file instead of the command line.",
+)
 @click.pass_context
-def batch(ctx, commands_json):
+def batch(ctx, commands_json, commands_file):
     """Execute multiple NIF commands in one call.
 
     Commands run sequentially — later commands see earlier changes.
@@ -1009,6 +2350,16 @@ def batch(ctx, commands_json):
       modkit nif batch '[{"tool":"inspect","args":{"path":"weapon.nif","block_id":0}}]'
     """
     fmt = ctx.obj["fmt"]
+    if (commands_json is None) == (commands_file is None):
+        output(_error("Provide exactly one of COMMANDS_JSON or --file"), fmt)
+        return
+    if commands_file is not None:
+        try:
+            with open(commands_file, encoding="utf-8") as stream:
+                commands_json = stream.read()
+        except OSError as e:
+            output(_error(f"Could not read commands file: {e}"), fmt)
+            return
     try:
         commands = json.loads(commands_json)
     except json.JSONDecodeError as e:
@@ -1058,6 +2409,17 @@ def batch(ctx, commands_json):
         for name, val in args.get("fields", {}).items():
             block.set_field(name, val)
         return {"block_id": args["block_id"], "updated_fields": list(args.get("fields", {}).keys())}
+
+    def _batch_save(args):
+        sid = args["session_id"]
+        nif_file = _get_or_load(sid)
+        path = args.get("path") or sessions[sid]["path"]
+        if not path:
+            return _error("Provide path for a session without an original path")
+        path = os.path.normpath(os.path.abspath(path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        nif_file.save(path)
+        return {"saved": path}
 
     def _batch_copy_blocks(args):
         src = _get_or_load(args["source_session"])
@@ -1141,6 +2503,7 @@ def batch(ctx, commands_json):
     dispatch = {
         "inspect": _batch_inspect,
         "modify": _batch_modify,
+        "save": _batch_save,
         "copy_blocks": _batch_copy_blocks,
         "add_block": _batch_add_block,
         "remove_blocks": _batch_remove_blocks,

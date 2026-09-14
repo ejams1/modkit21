@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from cli.main import cli
-from creation_lib.esp import Plugin
+from creation_lib.esp import Group, Plugin, PluginHeader, Record, Subrecord
 from creation_lib.esp import native_runtime
 from creation_lib.esp.editor.validate import Issue, IssueCategory, Severity, ValidationReport
 
@@ -20,6 +21,102 @@ def _make_plugin(path: Path) -> Plugin:
     plugin.add_record(record)
     plugin.save(path)
     return plugin
+
+
+def _make_cell_plugin(path: Path) -> None:
+    cell_form_id = 0x01000800
+    header = PluginHeader(masters=["Fallout4.esm"], master_sizes=[0])
+    cell = Record(
+        "CELL",
+        cell_form_id,
+        subrecords=[Subrecord("EDID", b"CliCell\0")],
+    )
+    placed = Record("REFR", 0x01000801)
+    label = cell_form_id.to_bytes(4, "little")
+    plugin = Plugin(
+        plugin_name=path.name,
+        file_path=path,
+        game="fo4",
+        header=header,
+        root_items=[
+            Group(
+                b"CELL",
+                0,
+                children=[
+                    Group(
+                        (0).to_bytes(4, "little", signed=True),
+                        2,
+                        children=[
+                            Group(
+                                (0).to_bytes(4, "little", signed=True),
+                                3,
+                                children=[
+                                    cell,
+                                    Group(
+                                        label,
+                                        6,
+                                        children=[Group(label, 9, children=[placed])],
+                                    ),
+                                ],
+                            )
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+    plugin.save(path)
+
+
+def _make_world_plugin(path: Path) -> None:
+    world_form_id = 0x01000900
+    cell_form_id = 0x01000910
+    header = PluginHeader(masters=["Fallout4.esm"], master_sizes=[0])
+    world = Record(
+        "WRLD",
+        world_form_id,
+        subrecords=[Subrecord("EDID", b"CliWorld\0")],
+    )
+    cell = Record(
+        "CELL",
+        cell_form_id,
+        subrecords=[
+            Subrecord("EDID", b"CliWorld_0_0\0"),
+            Subrecord("XCLC", struct.pack("<iiI", 0, 0, 0)),
+        ],
+    )
+    land = Record("LAND", 0x01000930)
+    cell_label = cell_form_id.to_bytes(4, "little")
+    cell_children = Group(
+        cell_label,
+        6,
+        children=[Group(cell_label, 9, children=[land])],
+    )
+    world_children = Group(
+        world_form_id.to_bytes(4, "little"),
+        1,
+        children=[
+            Group(
+                struct.pack("<hh", 0, 0),
+                4,
+                children=[
+                    Group(
+                        struct.pack("<hh", 0, 0),
+                        5,
+                        children=[cell, cell_children],
+                    )
+                ],
+            )
+        ],
+    )
+    plugin = Plugin(
+        plugin_name=path.name,
+        file_path=path,
+        game="fo4",
+        header=header,
+        root_items=[Group(b"WRLD", 0, children=[world, world_children])],
+    )
+    plugin.save(path)
 
 
 def test_esp_export_and_import_roundtrip(tmp_path) -> None:
@@ -113,6 +210,76 @@ def test_esp_list_records_filters_and_emits_subrecord_data(tmp_path) -> None:
     assert payload["types"] == ["MISC", "KYWD"]
     assert payload["subrecords"] == ["EDID"]
     assert all(record["subrecord_data"]["EDID"] for record in payload["records"])
+
+
+def test_esp_cell_children_lazy_matches_eager_for_plugin_with_master(tmp_path) -> None:
+    plugin_path = tmp_path / "CliCell.esp"
+    _make_cell_plugin(plugin_path)
+    runner = CliRunner()
+
+    lazy_result = runner.invoke(
+        cli,
+        ["--game", "fo4", "esp", "cell-children", str(plugin_path), "CliCell", "--lazy"],
+    )
+    eager_result = runner.invoke(
+        cli,
+        ["--game", "fo4", "esp", "cell-children", str(plugin_path), "CliCell", "--eager"],
+    )
+
+    assert lazy_result.exit_code == 0, lazy_result.output
+    assert eager_result.exit_code == 0, eager_result.output
+    lazy_payload = json.loads(lazy_result.output)
+    eager_payload = json.loads(eager_result.output)
+    assert lazy_payload["cell_form_id"] == "01000800"
+    assert lazy_payload["children"] == eager_payload["children"], (
+        lazy_payload,
+        eager_payload,
+    )
+    assert lazy_payload["children"] == [
+        {
+            "form_id": 0x01000801,
+            "form_key": "CliCell.esp:000801",
+            "signature": "REFR",
+            "group_type": 9,
+        }
+    ]
+
+
+def test_esp_cell_slice_roots_selects_world_coordinate_bounds(tmp_path) -> None:
+    plugin_path = tmp_path / "CliWorld.esp"
+    _make_world_plugin(plugin_path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--game",
+            "fo4",
+            "esp",
+            "cell-slice-roots",
+            str(plugin_path),
+            "CliWorld",
+            "--min-x",
+            "-1",
+            "--min-y",
+            "-1",
+            "--max-x",
+            "1",
+            "--max-y",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["worldspace_form_keys"] == ["CliWorld.esp:000900"]
+    assert payload["cell_form_keys"] == ["CliWorld.esp:000910"]
+    assert payload["cell_grids"] == {
+        "CliWorld.esp:000910": {"x": 0, "y": 0}
+    }
+    assert payload["cell_children"]["CliWorld.esp:000910"] == {
+        "Persistent": [],
+        "Temporary": [],
+    }
 
 
 def test_esp_get_record_by_editor_id(tmp_path) -> None:

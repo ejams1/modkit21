@@ -60,18 +60,25 @@ def _gitea_creds() -> dict:
 
 @git.command()
 @click.argument("name")
+@click.argument("paths", nargs=-1)
+@click.option("--all", "all_files", is_flag=True, help="Explicitly include all changes in this mod repository.")
+@click.option("--message", "-m", default=None, help="Commit message (default: timestamped Mod Builder message).")
+@click.option("--no-push", is_flag=True, help="Create a local commit without pushing.")
 @click.pass_context
-def commit(ctx, name):
-    """Stage all changes, commit, and push."""
+def commit(ctx, name, paths, all_files, message, no_push):
+    """Commit literal mod-relative PATHS and push. Select PATHS or --all."""
     from creation_lib.mod.git_ops import git_commit
+    from cli._output import output
+
+    if bool(paths) == all_files:
+        raise click.UsageError("Select one or more mod-relative paths, or --all (not both).")
 
     mod_dir = _get_mod_dir(name)
     try:
-        sha = git_commit(mod_dir, name, **_gitea_creds())
-        if sha:
-            click.echo(f"Committed: {sha[:8]}")
-        else:
-            click.echo("No changes to commit.")
+        sha = git_commit(mod_dir, name, paths=list(paths) if paths else None,
+                         message=message, push=not no_push, **_gitea_creds())
+        output({"mod": name, "commit": sha or None, "paths": list(paths) if paths else None,
+                "pushed": bool(sha) and not no_push}, ctx.obj["fmt"])
     except RuntimeError as e:
         raise click.ClickException(str(e))
 

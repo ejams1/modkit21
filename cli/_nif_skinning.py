@@ -1,8 +1,4 @@
-"""NIF skinning tool functions for CLI use.
-
-Extracted from tools/nif_mcp/nif_server.py — operates on NifFile objects
-directly, no MCP session management needed.
-"""
+"""NIF skinning tool functions for CLI use. Operate on NifFile objects directly."""
 from __future__ import annotations
 import os
 from typing import Any
